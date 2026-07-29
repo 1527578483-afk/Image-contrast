@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多机位视频音频对齐工具</title>
+<style>
+/* ============================================================
+   Reset & Base
+   ============================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #0d1117; color: #c9d1d9; line-height: 1.6;
+  min-height: 100vh;
+}
+a { color: #58a6ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ============================================================
+   Layout
+   ============================================================ */
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 32px 20px 80px;
+}
+
+.app__header {
+  text-align: center;
+  padding: 40px 0 32px;
+}
+.app__title {
+  font-size: 1.8rem; font-weight: 700; color: #f0f6fc;
+  letter-spacing: -0.02em;
+}
+.app__subtitle {
+  margin-top: 6px; font-size: 0.9rem; color: #8b949e;
+}
+
+/* ============================================================
+   Cards & Sections
+   ============================================================ */
+.card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 24px;
+  margin-bottom: 20px;
+}
+
+.card--drop {
+  border-style: dashed;
+  border-color: #30363d;
+  text-align: center;
+  padding: 48px 24px;
+  transition: border-color 0.2s, background 0.2s;
+  cursor: pointer;
+}
+.card--drop:hover,
+.card--drop.drag-over {
+  border-color: #58a6ff;
+  background: #1a2332;
+}
+
+.drop__icon { font-size: 2.4rem; margin-bottom: 12px; }
+.drop__text { font-size: 1rem; color: #c9d1d9; }
+.drop__hint { font-size: 0.8rem; color: #8b949e; margin-top: 6px; }
+.drop__input { display: none; }
+
+.section-title {
+  font-size: 1rem; font-weight: 600; color: #f0f6fc;
+  margin-bottom: 14px;
+  display: flex; align-items: center; gap: 8px;
+}
+
+/* ============================================================
+   File List
+   ============================================================ */
+.file-list { display: flex; flex-direction: column; gap: 10px; }
+
+.file-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  transition: border-color 0.15s;
+}
+.file-item:hover { border-color: #30363d; }
+
+.file-item__index {
+  width: 28px; height: 28px;
+  background: #238636; color: #fff;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.75rem; font-weight: 700;
+  flex-shrink: 0;
+}
+.file-item__index--ref {
+  background: #da3633;
+}
+
+.file-item__info { flex: 1; min-width: 0; }
+.file-item__name {
+  font-size: 0.9rem; font-weight: 600; color: #f0f6fc;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.file-item__meta {
+  font-size: 0.75rem; color: #8b949e; margin-top: 2px;
+  display: flex; gap: 12px; flex-wrap: wrap;
+}
+.file-item__meta span {
+  display: inline-flex; align-items: center; gap: 3px;
+}
+
+.file-item__status {
+  font-size: 0.75rem; padding: 4px 10px; border-radius: 12px;
+  white-space: nowrap; flex-shrink: 0;
+}
+.status--good { background: #1a3a2a; color: #3fb950; }
+.status--silent { background: #3a2a1a; color: #d29922; }
+.status--pending { background: #1a2332; color: #8b949e; }
+.status--ref { background: #3a1a1a; color: #f85149; }
+
+.file-item__remove {
+  background: none; border: none; color: #8b949e; cursor: pointer;
+  font-size: 1.1rem; padding: 4px 8px; border-radius: 4px;
+  flex-shrink: 0;
+}
+.file-item__remove:hover { color: #f85149; background: #3a1a1a; }
+
+/* ============================================================
+   Buttons
+   ============================================================ */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 10px 20px; border-radius: 8px; font-size: 0.9rem;
+  font-weight: 600; border: 1px solid transparent; cursor: pointer;
+  transition: all 0.15s; font-family: inherit;
+}
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn--primary {
+  background: #238636; color: #fff; border-color: #2ea043;
+}
+.btn--primary:hover:not(:disabled) { background: #2ea043; }
+
+.btn--secondary {
+  background: #21262d; color: #c9d1d9; border-color: #30363d;
+}
+.btn--secondary:hover:not(:disabled) { background: #30363d; }
+
+.btn--danger {
+  background: #da3633; color: #fff; border-color: #f85149;
+}
+.btn--danger:hover:not(:disabled) { background: #f85149; }
+
+.btn--sm { padding: 6px 14px; font-size: 0.8rem; }
+
+.btn-row {
+  display: flex; gap: 10px; flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+/* ============================================================
+   Offset Sliders
+   ============================================================ */
+.offset-grid { display: flex; flex-direction: column; gap: 14px; }
+
+.offset-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px; background: #0d1117;
+  border: 1px solid #21262d; border-radius: 8px;
+}
+.offset-row__label {
+  font-size: 0.8rem; font-weight: 600; color: #f0f6fc;
+  min-width: 50px; flex-shrink: 0;
+}
+.offset-row__slider {
+  flex: 1; -webkit-appearance: none; height: 6px;
+  background: #30363d; border-radius: 3px; outline: none;
+}
+.offset-row__slider::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 18px; height: 18px;
+  border-radius: 50%; background: #58a6ff; cursor: pointer;
+  border: 2px solid #0d1117;
+}
+.offset-row__value {
+  font-size: 0.85rem; font-weight: 600; color: #58a6ff;
+  min-width: 64px; text-align: right; font-variant-numeric: tabular-nums;
+  font-family: "SF Mono", "JetBrains Mono", "Cascadia Code", monospace;
+}
+.offset-row__reset {
+  background: none; border: 1px solid #30363d; color: #8b949e;
+  cursor: pointer; font-size: 0.7rem; padding: 3px 8px;
+  border-radius: 4px;
+}
+.offset-row__reset:hover { color: #f0f6fc; border-color: #58a6ff; }
+
+/* ============================================================
+   Results
+   ============================================================ */
+.result-box {
+  background: #0d1117; border: 1px solid #21262d;
+  border-radius: 8px; padding: 16px;
+}
+.result-box__row {
+  display: flex; justify-content: space-between;
+  padding: 5px 0; font-size: 0.85rem;
+}
+.result-box__label { color: #8b949e; }
+.result-box__value { color: #f0f6fc; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.download-list { display: flex; flex-direction: column; gap: 6px; }
+.download-link {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; background: #0d1117;
+  border: 1px solid #21262d; border-radius: 8px;
+  font-size: 0.85rem; transition: border-color 0.15s;
+}
+.download-link:hover { border-color: #58a6ff; }
+.download-link__icon { font-size: 1.1rem; flex-shrink: 0; }
+
+/* ============================================================
+   Toast / Alerts
+   ============================================================ */
+.toast-container {
+  position: fixed; bottom: 20px; right: 20px;
+  display: flex; flex-direction: column-reverse; gap: 8px;
+  z-index: 9999;
+}
+.toast {
+  padding: 12px 20px; border-radius: 8px; font-size: 0.85rem;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  animation: slideIn 0.25s ease-out;
+  max-width: 400px;
+}
+.toast--info { background: #1a3a5c; color: #79c0ff; border: 1px solid #1f6feb; }
+.toast--success { background: #1a3a2a; color: #3fb950; border: 1px solid #238636; }
+.toast--error { background: #3a1a1a; color: #f85149; border: 1px solid #da3633; }
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(40px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* ============================================================
+   Loading spinner
+   ============================================================ */
+.spinner {
+  display: inline-block; width: 16px; height: 16px;
+  border: 2px solid #30363d; border-top-color: #58a6ff;
+  border-radius: 50%; animation: spin 0.6s linear infinite;
+  vertical-align: middle; margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ============================================================
+   Checkbox
+   ============================================================ */
+.checkbox-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 10px; font-size: 0.85rem; color: #8b949e;
+}
+.checkbox-row input[type="checkbox"] {
+  accent-color: #238636; width: 16px; height: 16px;
+}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media (max-width: 640px) {
+  .app { padding: 16px 12px 60px; }
+  .app__title { font-size: 1.4rem; }
+  .file-item { flex-wrap: wrap; }
+  .offset-row { flex-wrap: wrap; }
+  .btn-row { flex-direction: column; }
+  .btn { justify-content: center; }
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- Header -->
+  <header class="app__header">
+    <h1 class="app__title">🎬 多机位视频音频对齐</h1>
+    <p class="app__subtitle">纯本地离线 · 基于 FFmpeg + NumPy/SciPy 音频互相关 · 流拷贝无损裁剪</p>
+  </header>
+
+  <!-- Upload Section -->
+  <section class="card card--drop" id="dropZone">
+    <div class="drop__icon">📂</div>
+    <p class="drop__text">拖拽视频文件到此处，或点击选择</p>
+    <p class="drop__hint">支持 MP4 · MOV · 多文件同时拖入 · 纯本地处理不上传云端</p>
+    <input type="file" class="drop__input" id="fileInput" accept="video/*" multiple>
+  </section>
+
+  <!-- File List -->
+  <section class="card" id="fileSection" style="display:none">
+    <h2 class="section-title">📋 视频列表 <span id="fileCount" style="font-weight:400;color:#8b949e;font-size:0.8rem;"></span></h2>
+    <div class="file-list" id="fileList"></div>
+    <div class="btn-row">
+      <button class="btn btn--primary" id="btnAnalyze" disabled>
+        🔍 分析音频对齐
+      </button>
+      <button class="btn btn--secondary btn--sm" id="btnAddMore">
+        ＋ 添加更多视频
+      </button>
+      <button class="btn btn--secondary btn--sm" id="btnClearAll" style="color:#f85149;">
+        清空全部
+      </button>
+    </div>
+  </section>
+
+  <!-- Analysis Results -->
+  <section class="card" id="resultSection" style="display:none">
+    <h2 class="section-title">📊 对齐结果</h2>
+    <div class="result-box" id="resultInfo"></div>
+
+    <h3 style="margin-top:18px;font-size:0.9rem;color:#f0f6fc;">🎚 手动微调偏移量（秒）</h3>
+    <div class="offset-grid" id="offsetGrid"></div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="chkCompose">
+      <label for="chkCompose">生成分屏合成视频（⚠️ 此步骤需重新编码，输入文件不受影响）</label>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn--danger" id="btnProcess">
+        ✂️ 执行裁剪（流拷贝·无损）
+      </button>
+    </div>
+  </section>
+
+  <!-- Output Files -->
+  <section class="card" id="outputSection" style="display:none">
+    <h2 class="section-title">📦 输出文件</h2>
+    <div class="download-list" id="downloadList"></div>
+  </section>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+const state = {
+  sessionId: '',
+  files: [],           // uploaded file metadata from server
+  offsets: [],         // current offset per slot
+  scores: [],
+  commonStart: 0,
+  commonEnd: 0,
+  commonDuration: 0,
+  referenceIndex: 0,
+  rmsLevels: [],
+  isSilent: [],
+  durations: [],
+  originalOffsets: [], // for reset
+  isAnalyzing: false,
+  isProcessing: false,
+};
+
+// ============================================================
+// DOM refs
+// ============================================================
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+
+const dropZone = $('#dropZone');
+const fileInput = $('#fileInput');
+const fileSection = $('#fileSection');
+const fileList = $('#fileList');
+const fileCount = $('#fileCount');
+const btnAnalyze = $('#btnAnalyze');
+const btnAddMore = $('#btnAddMore');
+const btnClearAll = $('#btnClearAll');
+const resultSection = $('#resultSection');
+const resultInfo = $('#resultInfo');
+const offsetGrid = $('#offsetGrid');
+const btnProcess = $('#btnProcess');
+const chkCompose = $('#chkCompose');
+const outputSection = $('#outputSection');
+const downloadList = $('#downloadList');
+const toastContainer = $('#toastContainer');
+
+// ============================================================
+// Toast
+// ============================================================
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = `toast toast--${type}`;
+  el.textContent = msg;
+  toastContainer.appendChild(el);
+  setTimeout(() => { el.remove(); }, 4000);
+}
+
+// ============================================================
+// Drag & Drop + File Input
+// ============================================================
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.classList.add('drag-over');
+});
+dropZone.addEventListener('dragleave', () => {
+  dropZone.classList.remove('drag-over');
+});
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('video/'));
+  if (files.length) uploadFiles(files);
+});
+fileInput.addEventListener('change', () => {
+  const files = Array.from(fileInput.files);
+  if (files.length) uploadFiles(files);
+  fileInput.value = '';
+});
+btnAddMore.addEventListener('click', () => fileInput.click());
+
+// ============================================================
+// Upload
+// ============================================================
+async function uploadFiles(files) {
+  if (files.length === 0) return;
+
+  const formData = new FormData();
+  files.forEach(f => formData.append('files', f));
+
+  // Show uploading state
+  dropZone.style.opacity = '0.5';
+  dropZone.style.pointerEvents = 'none';
+
+  try {
+    const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+    const data = await resp.json();
+
+    if (!data.success) {
+      toast('上传失败: ' + data.message, 'error');
+      return;
+    }
+
+    state.sessionId = data.session_id;
+    state.files = data.files;
+
+    // Reset analysis state
+    state.offsets = [];
+    state.scores = [];
+    resultSection.style.display = 'none';
+    outputSection.style.display = 'none';
+
+    renderFileList();
+    fileSection.style.display = 'block';
+    dropZone.style.display = 'none';
+
+    toast(`已上传 ${data.files.length} 个视频`, 'success');
+  } catch (err) {
+    toast('上传失败: ' + err.message, 'error');
+  } finally {
+    dropZone.style.opacity = '1';
+    dropZone.style.pointerEvents = 'auto';
+  }
+}
+
+// ============================================================
+// Render file list
+// ============================================================
+function renderFileList() {
+  fileList.innerHTML = '';
+  fileCount.textContent = `(${state.files.length} 个视频)`;
+
+  state.files.forEach((f, i) => {
+    const sizeMB = (f.size / 1024 / 1024).toFixed(1);
+    const durStr = f.duration ? `${f.duration.toFixed(1)}s` : '?';
+    const resStr = f.width ? `${f.width}×${f.height}` : '?';
+    const codecStr = f.video_codec || '?';
+
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    div.innerHTML = `
+      <div class="file-item__index" id="fileIdx${i}">${i + 1}</div>
+      <div class="file-item__info">
+        <div class="file-item__name" title="${escHtml(f.original_name)}">${escHtml(f.original_name)}</div>
+        <div class="file-item__meta">
+          <span>⏱ ${durStr}</span>
+          <span>📐 ${resStr}</span>
+          <span>🎞 ${codecStr}</span>
+          <span>💾 ${sizeMB} MB</span>
+          ${f.has_audio === false ? '<span style="color:#d29922;">🔇 无音频</span>' : ''}
+        </div>
+      </div>
+      <div class="file-item__status status--pending" id="fileStatus${i}">待分析</div>
+      <button class="file-item__remove" data-idx="${i}" title="移除">✕</button>
+    `;
+    fileList.appendChild(div);
+  });
+
+  // Remove buttons
+  fileList.querySelectorAll('.file-item__remove').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const idx = parseInt(btn.dataset.idx);
+      removeFile(idx);
+    });
+  });
+
+  btnAnalyze.disabled = state.files.length < 2;
+}
+
+function removeFile(idx) {
+  state.files.splice(idx, 1);
+  if (state.files.length === 0) {
+    fileSection.style.display = 'none';
+    resultSection.style.display = 'none';
+    outputSection.style.display = 'none';
+    dropZone.style.display = 'block';
+    state.sessionId = '';
+    state.offsets = [];
+  }
+  // Re-index
+  state.files.forEach((f, i) => f.index = i);
+  renderFileList();
+}
+
+btnClearAll.addEventListener('click', () => {
+  state.files = [];
+  state.sessionId = '';
+  state.offsets = [];
+  fileSection.style.display = 'none';
+  resultSection.style.display = 'none';
+  outputSection.style.display = 'none';
+  dropZone.style.display = 'block';
+});
+
+// ============================================================
+// Analyze
+// ============================================================
+btnAnalyze.addEventListener('click', async () => {
+  if (state.isAnalyzing || state.files.length < 2) return;
+
+  state.isAnalyzing = true;
+  btnAnalyze.disabled = true;
+  btnAnalyze.innerHTML = '<span class="spinner"></span> 分析中…';
+
+  try {
+    const resp = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: state.sessionId,
+        manual_offsets: null
+      })
+    });
+    const data = await resp.json();
+
+    if (!data.success) {
+      toast('分析失败: ' + data.message, 'error');
+      return;
+    }
+
+    // Update state
+    state.offsets = data.offsets;
+    state.originalOffsets = [...data.offsets];
+    state.scores = data.scores;
+    state.commonStart = data.common_start;
+    state.commonEnd = data.common_end;
+    state.commonDuration = data.common_duration;
+    state.referenceIndex = data.reference_index;
+    state.rmsLevels = data.rms_levels;
+    state.isSilent = data.is_silent;
+    state.durations = data.durations;
+
+    renderResults();
+    resultSection.style.display = 'block';
+    resultSection.scrollIntoView({ behavior: 'smooth' });
+
+    toast(data.message, 'success');
+  } catch (err) {
+    toast('分析失败: ' + err.message, 'error');
+  } finally {
+    state.isAnalyzing = false;
+    btnAnalyze.disabled = false;
+    btnAnalyze.innerHTML = '🔍 重新分析音频对齐';
+  }
+});
+
+// ============================================================
+// Render analysis results
+// ============================================================
+function renderResults() {
+  // Summary box
+  const refName = state.files[state.referenceIndex]?.original_name || `槽位 ${state.referenceIndex}`;
+  resultInfo.innerHTML = `
+    <div class="result-box__row">
+      <span class="result-box__label">参考基准</span>
+      <span class="result-box__value">${escHtml(refName)} (槽位 ${state.referenceIndex + 1})</span>
+    </div>
+    <div class="result-box__row">
+      <span class="result-box__label">共同窗口</span>
+      <span class="result-box__value">${state.commonStart.toFixed(3)}s → ${state.commonEnd.toFixed(3)}s</span>
+    </div>
+    <div class="result-box__row">
+      <span class="result-box__label">共同时长</span>
+      <span class="result-box__value">${state.commonDuration.toFixed(3)}s</span>
+    </div>
+  `;
+
+  // Update file status badges
+  state.files.forEach((f, i) => {
+    const statusEl = document.getElementById('fileStatus' + i);
+    const idxEl = document.getElementById('fileIdx' + i);
+    if (!statusEl) return;
+
+    if (i === state.referenceIndex) {
+      statusEl.className = 'file-item__status status--ref';
+      statusEl.textContent = '🎯 参考基准';
+      if (idxEl) idxEl.className = 'file-item__index file-item__index--ref';
+    } else if (state.isSilent[i]) {
+      statusEl.className = 'file-item__status status--silent';
+      statusEl.textContent = '🔇 静音';
+    } else {
+      const score = state.scores[i] || 0;
+      statusEl.className = 'file-item__status ' + (score > 0.5 ? 'status--good' : 'status--silent');
+      statusEl.textContent = `ρ=${score.toFixed(3)}`;
+    }
+  });
+
+  // Offset sliders
+  offsetGrid.innerHTML = '';
+  state.files.forEach((f, i) => {
+    const offset = state.offsets[i] || 0;
+    const original = state.originalOffsets[i] || 0;
+    const isRef = i === state.referenceIndex;
+    const isSilent = state.isSilent[i];
+    const maxOff = Math.max(Math.abs(offset) * 3, state.commonDuration, 30);
+
+    const row = document.createElement('div');
+    row.className = 'offset-row';
+    row.innerHTML = `
+      <span class="offset-row__label">
+        ${isRef ? '🎯' : isSilent ? '🔇' : '🎬'} 槽${i + 1}
+      </span>
+      <input type="range" class="offset-row__slider"
+             min="${(-maxOff).toFixed(0)}" max="${maxOff.toFixed(0)}" step="0.01"
+             value="${offset.toFixed(2)}"
+             data-idx="${i}"
+             ${isRef ? 'disabled' : ''}>
+      <span class="offset-row__value" id="offVal${i}">${offset.toFixed(3)}s</span>
+      <button class="offset-row__reset" data-idx="${i}" data-orig="${original.toFixed(3)}"
+              ${Math.abs(offset - original) < 0.005 ? 'disabled' : ''}>
+        还原
+      </button>
+    `;
+    offsetGrid.appendChild(row);
+  });
+
+  // Slider events
+  offsetGrid.querySelectorAll('.offset-row__slider').forEach(slider => {
+    slider.addEventListener('input', () => {
+      const idx = parseInt(slider.dataset.idx);
+      const val = parseFloat(slider.value);
+      state.offsets[idx] = val;
+      const valEl = document.getElementById('offVal' + idx);
+      if (valEl) valEl.textContent = val.toFixed(3) + 's';
+
+      // Enable/disable reset button
+      const orig = parseFloat(slider.parentElement.querySelector('.offset-row__reset')?.dataset.orig || 0);
+      const resetBtn = slider.parentElement.querySelector('.offset-row__reset');
+      if (resetBtn) resetBtn.disabled = Math.abs(val - orig) < 0.005;
+    });
+  });
+
+  // Reset buttons
+  offsetGrid.querySelectorAll('.offset-row__reset').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.dataset.idx);
+      const orig = parseFloat(btn.dataset.orig);
+      state.offsets[idx] = orig;
+      const slider = offsetGrid.querySelector(`.offset-row__slider[data-idx="${idx}"]`);
+      if (slider) slider.value = orig;
+      const valEl = document.getElementById('offVal' + idx);
+      if (valEl) valEl.textContent = orig.toFixed(3) + 's';
+      btn.disabled = true;
+    });
+  });
+}
+
+// ============================================================
+// Process (trim)
+// ============================================================
+btnProcess.addEventListener('click', async () => {
+  if (state.isProcessing) return;
+
+  state.isProcessing = true;
+  btnProcess.disabled = true;
+  btnProcess.innerHTML = '<span class="spinner"></span> 裁剪中…（大文件可能需要几分钟）';
+
+  try {
+    const resp = await fetch('/api/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: state.sessionId,
+        offsets: state.offsets,
+        common_duration: state.commonDuration,
+        compose_split: chkCompose.checked
+      })
+    });
+    const data = await resp.json();
+
+    if (!data.success) {
+      toast('处理失败: ' + data.message, 'error');
+      return;
+    }
+
+    renderDownloads(data);
+    outputSection.style.display = 'block';
+    outputSection.scrollIntoView({ behavior: 'smooth' });
+
+    toast(data.message, 'success');
+  } catch (err) {
+    toast('处理失败: ' + err.message, 'error');
+  } finally {
+    state.isProcessing = false;
+    btnProcess.disabled = false;
+    btnProcess.innerHTML = '✂️ 执行裁剪（流拷贝·无损）';
+  }
+});
+
+// ============================================================
+// Render download links
+// ============================================================
+function renderDownloads(data) {
+  downloadList.innerHTML = '';
+
+  const allFiles = [...data.output_files];
+
+  // Separate video files, log file, compose file
+  const videos = allFiles.filter(f => f.startsWith('aligned_'));
+  const logs = allFiles.filter(f => f.endsWith('.txt'));
+  const composes = allFiles.filter(f => f.startsWith('composite_'));
+
+  videos.forEach(name => {
+    const link = document.createElement('a');
+    link.className = 'download-link';
+    link.href = `/api/download/${state.sessionId}/${encodeURIComponent(name)}`;
+    link.download = name;
+    link.innerHTML = `<span class="download-link__icon">🎬</span> ${escHtml(name)}`;
+    downloadList.appendChild(link);
+  });
+
+  logs.forEach(name => {
+    const link = document.createElement('a');
+    link.className = 'download-link';
+    link.href = `/api/download/${state.sessionId}/${encodeURIComponent(name)}`;
+    link.download = name;
+    link.innerHTML = `<span class="download-link__icon">📄</span> ${escHtml(name)}`;
+    downloadList.appendChild(link);
+  });
+
+  composes.forEach(name => {
+    const link = document.createElement('a');
+    link.className = 'download-link';
+    link.href = `/api/download/${state.sessionId}/${encodeURIComponent(name)}`;
+    link.download = name;
+    link.style.borderColor = '#da3633';
+    link.innerHTML = `<span class="download-link__icon">🎥</span> ${escHtml(name)} <span style="font-size:0.7rem;color:#f85149;">(分屏合成·H.264)</span>`;
+    downloadList.appendChild(link);
+  });
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+function escHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+</script>
+
+</body>
+</html>

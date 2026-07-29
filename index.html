@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Noto+Serif+SC:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <title>影像搜集</title>
+</head>
+<body>
+  <div class="container">
+    <!-- ============================================
+    Navigation Bar
+    ============================================ -->
+    <nav class="nav" id="nav">
+      <button type="button" class="nav__back" id="navBack" style="display:none">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="15,18 9,12 15,6"/>
+        </svg>
+        返回
+      </button>
+      <span class="nav__breadcrumb" id="navBreadcrumb">分组</span>
+      <div class="nav__actions">
+        <div class="nav__zoom" id="navZoom">
+          <button type="button" class="nav__zoom-btn" id="btnZoomOut" title="缩小 (Ctrl+-)">−</button>
+          <span class="nav__zoom-label" id="zoomLabel">100%</span>
+          <button type="button" class="nav__zoom-btn" id="btnZoomIn" title="放大 (Ctrl+=)">+</button>
+          <button type="button" class="nav__zoom-btn" id="btnZoomReset" title="重置缩放 (Ctrl+0)" style="font-size:0.65rem;">⟲</button>
+        </div>
+        <button type="button" class="nav__action-btn" id="navCompare" title="对比模式">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="9" height="18"/>
+            <rect x="13" y="8" width="9" height="13"/>
+          </svg>
+          对比
+        </button>
+      </div>
+    </nav>
+
+    <!-- ============================================
+    View: Groups Overview (Home)
+    ============================================ -->
+    <div id="viewGroups" class="view">
+      <!-- Groups Grid -->
+      <div class="groups-section">
+        <div class="groups-section__header">
+          <h2 class="groups-section__title">分组</h2>
+          <div class="groups-section__header-right">
+            <span class="groups-section__count" id="groupsCount">0 个分组</span>
+            <button type="button" class="btn btn--sm" id="btnNewGroup">+ 新建分组</button>
+          </div>
+        </div>
+        <div class="groups-grid" id="groupsGrid"></div>
+        <div id="groupsEmpty" class="empty" style="display:none">
+          <div class="empty__frame"><div class="empty__frame-inner">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="0.8">
+              <rect x="2" y="4" width="20" height="16" rx="2"/>
+              <path d="M2 8h20"/>
+            </svg>
+          </div></div>
+          <h3 class="empty__title">尚无分组</h3>
+          <p class="empty__desc">添加第一个视频以创建分组</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================
+    View: Group Detail
+    ============================================ -->
+    <div id="viewGroup" class="view" style="display:none">
+      <header class="group-detail__head">
+        <h1 class="group-detail__name" id="groupDetailName"></h1>
+        <p class="group-detail__desc" id="groupDetailDesc"></p>
+        <div class="group-detail__meta" id="groupDetailMeta"></div>
+      </header>
+
+      <!-- Sub-groups section -->
+      <div class="sub-groups-section" id="subGroupsSection" style="display:none">
+        <div class="sub-groups-section__header">
+          <h3 class="sub-groups-section__title">子分组</h3>
+          <button type="button" class="btn btn--sm" id="btnNewSubGroup">+ 新建子分组</button>
+        </div>
+        <div class="groups-grid groups-grid--sub" id="subGroupsGrid"></div>
+      </div>
+
+      <!-- Add video button + collapsible form -->
+      <div class="group-add-video" id="groupAddVideo">
+        <button type="button" class="btn btn--add-video" id="btnAddVideo">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          添加视频
+        </button>
+        <form id="videoForm" class="form form--collapsed">
+          <div class="form__row">
+            <div class="form__field form__field--half">
+              <label for="videoTitle" class="form__label">标题</label>
+              <input id="videoTitle" type="text" class="form__input" placeholder="视频名称" required />
+            </div>
+            <div class="form__field form__field--half">
+              <label for="videoDescription" class="form__label">备注</label>
+              <input id="videoDescription" type="text" class="form__input" placeholder="可选描述…" />
+            </div>
+          </div>
+          <div class="form__field">
+            <label class="form__label">视频文件</label>
+            <div class="dropzone" id="fileDropZone">
+              <input id="videoFile" type="file" accept="video/*" required class="dropzone__input" multiple />
+              <div class="dropzone__inner">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+                  <rect x="2" y="4" width="20" height="16" rx="2"/>
+                  <circle cx="8" cy="10" r="2"/><circle cx="16" cy="12" r="2"/>
+                  <circle cx="8" cy="16" r="2"/><circle cx="16" cy="8" r="2"/>
+                </svg>
+                <p class="dropzone__text">拖拽视频至此，或<span class="dropzone__link">选取文件</span></p>
+                <p class="dropzone__hint">MP4 · MOV · WebM</p>
+              </div>
+            </div>
+            <div class="file-badge" id="filePreview" style="display:none">
+              <span class="file-badge__name" id="fileName"></span>
+              <span class="file-badge__size" id="fileSize"></span>
+              <button type="button" class="file-badge__clear" id="fileClear" aria-label="清除">✕</button>
+            </div>
+          </div>
+          <div class="form__actions">
+            <button type="submit" class="btn">添加</button>
+          </div>
+        </form>
+      </div>
+
+
+      <!-- Uniform video grid -->
+      <div id="groupGallery" class="gallery gallery--uniform"></div>
+
+      <!-- Empty group -->
+      <div id="groupEmpty" class="empty" style="display:none">
+        <div class="empty__frame"><div class="empty__frame-inner">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="0.8">
+            <rect x="2" y="4" width="20" height="16" rx="2"/>
+            <polygon points="10,8 10,16 16,12" fill="currentColor" opacity="0.3"/>
+          </svg>
+        </div></div>
+        <h3 class="empty__title">此分组暂无影片</h3>
+        <p class="empty__desc">添加视频到此分组</p>
+      </div>
+
+      <!-- Master Play Control -->
+      <div class="master-control" id="groupMasterControl" style="display:none">
+        <div class="master-control__divider">
+          <span></span><span></span><span></span>
+        </div>
+        <button type="button" class="master-btn" id="groupMasterPlayBtn">
+          <svg class="master-btn__icon master-btn__icon--play" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5,3 19,12 5,21"/>
+          </svg>
+          <svg class="master-btn__icon master-btn__icon--pause" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="4" y="3" width="6" height="18"/><rect x="14" y="3" width="6" height="18"/>
+          </svg>
+          <span class="master-btn__label" id="groupMasterBtnLabel">全部播放</span>
+        </button>
+      </div>
+
+      <!-- Pagination -->
+      <div class="pagination" id="groupPagination" style="display:none">
+        <button type="button" class="page-btn" id="groupPrevPage" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15,18 9,12 15,6"/></svg>
+          上一页
+        </button>
+        <span class="page-indicator" id="groupPageIndicator">1 / 1</span>
+        <button type="button" class="page-btn" id="groupNextPage" disabled>
+          下一页
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9,18 15,12 9,6"/></svg>
+        </button>
+      </div>
+
+      <!-- Group actions -->
+      <div class="group-actions" id="groupActions" style="display:none">
+        <button type="button" class="btn btn--danger-outline" id="deleteGroupBtn">删除此分组</button>
+        <button type="button" class="btn" id="renameGroupBtn">重命名分组</button>
+      </div>
+    </div>
+
+    <!-- ============================================
+    View: Compare
+    ============================================ -->
+    <div id="viewCompare" class="view" style="display:none">
+      <header class="compare__head">
+        <div class="compare__head-left">
+          <h1 class="compare__title">对比视图</h1>
+          <p class="compare__subtitle">选择视频进行并列对比播放</p>
+        </div>
+        <div class="compare__head-right">
+          <button type="button" class="btn btn--sm compare__align-btn" id="btnAlignAudio" title="根据音频内容自动对齐视频">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="4,12 8,5 12,19 16,9 20,12"/>
+            </svg>
+            音频对齐
+          </button>
+          <button type="button" class="btn btn--sm compare__render-btn" id="btnRenderAll" title="渲染为 1080p 代理视频以流畅播放（保持原始帧率）">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="3" width="20" height="14" rx="2"/>
+              <polyline points="2,21 12,13 22,21"/>
+            </svg>
+            渲染
+          </button>
+          <button type="button" class="btn btn--sm compare__fullscreen-btn" id="btnFullscreen" title="全屏对比">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="15,3 21,3 21,9"/>
+              <polyline points="9,21 3,21 3,15"/>
+              <line x1="21" y1="3" x2="14" y2="10"/>
+              <line x1="3" y1="21" x2="10" y2="14"/>
+            </svg>
+            全屏
+          </button>
+        </div>
+      </header>
+
+      <!-- Video selector -->
+      <div class="compare__selector" id="compareSelector">
+        <div class="compare__selector-top">
+          <span class="compare__selector-label">选择分组：</span>
+        </div>
+        <div class="compare__group-tree" id="compareGroupTree"></div>
+        <div class="compare__chips" id="compareChips"></div>
+      </div>
+
+      <!-- Compare slots (4×2 grid, JS-generated) -->
+      <div class="compare__slots" id="compareSlots"></div>
+
+      <!-- Compare play control -->
+      <div class="master-control" id="compareMasterControl" style="display:none">
+        <button type="button" class="master-btn" id="compareMasterPlayBtn">
+          <svg class="master-btn__icon master-btn__icon--play" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5,3 19,12 5,21"/>
+          </svg>
+          <svg class="master-btn__icon master-btn__icon--pause" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="4" y="3" width="6" height="18"/><rect x="14" y="3" width="6" height="18"/>
+          </svg>
+          <span class="master-btn__label" id="compareMasterBtnLabel">同步播放</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Footer -->
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast" aria-live="polite"></div>
+
+  <!-- New Group Modal -->
+  <div class="modal-overlay" id="modalOverlay" style="display:none">
+    <div class="modal" id="modal">
+      <h3 class="modal__title" id="modalTitle">新建</h3>
+      <div class="modal__body">
+        <p class="modal__message" id="modalMessage" style="display:none"></p>
+        <div class="form__field" id="modalField1">
+          <label for="modalInput1" class="form__label" id="modalLabel1">分组名称</label>
+          <input id="modalInput1" type="text" class="form__input" placeholder="输入分组名称…" />
+        </div>
+        <div class="form__field" id="modalField2" style="display:none">
+          <label for="modalInput2" class="form__label" id="modalLabel2"></label>
+          <input id="modalInput2" type="text" class="form__input" />
+        </div>
+      </div>
+      <div class="modal__actions">
+        <button type="button" class="btn modal__cancel" id="modalCancel">取消</button>
+        <button type="button" class="btn modal__confirm" id="modalConfirm">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Video Modal -->
+  <div class="modal-overlay" id="exportModalOverlay" style="display:none">
+    <div class="modal modal--export" id="exportModal">
+      <h3 class="modal__title">导出合成视频</h3>
+      <div class="modal__body">
+        <div class="form__row">
+          <div class="form__field form__field--half">
+            <label class="form__label">分辨率</label>
+            <select id="exportResolution" class="form__input form__select">
+              <option value="auto">全屏尺寸（自动）</option>
+              <option value="1080p">1080p (1920×1080)</option>
+              <option value="720p">720p (1280×720)</option>
+              <option value="4k">4K (3840×2160)</option>
+              <option value="custom">自定义</option>
+            </select>
+          </div>
+          <div class="form__field form__field--half">
+            <label class="form__label">帧速率</label>
+            <select id="exportFramerate" class="form__input form__select">
+              <option value="auto">自动检测</option>
+              <option value="24">24 fps</option>
+              <option value="30">30 fps</option>
+              <option value="60">60 fps</option>
+              <option value="custom">自定义</option>
+            </select>
+          </div>
+        </div>
+        <div class="form__row" id="exportCustomRow" style="display:none">
+          <div class="form__field form__field--half">
+            <label class="form__label">宽度 (px)</label>
+            <input id="exportCustomWidth" type="number" class="form__input" placeholder="1920" min="320" max="7680" />
+          </div>
+          <div class="form__field form__field--half">
+            <label class="form__label">高度 (px)</label>
+            <input id="exportCustomHeight" type="number" class="form__input" placeholder="1080" min="240" max="4320" />
+          </div>
+        </div>
+        <div class="form__row" id="exportFpsCustomRow" style="display:none">
+          <div class="form__field form__field--half">
+            <label class="form__label">自定义帧率</label>
+            <input id="exportCustomFps" type="number" class="form__input" placeholder="30" min="1" max="120" />
+          </div>
+        </div>
+        <div class="form__field">
+          <label class="form__label">格式</label>
+          <select id="exportFormat" class="form__input form__select">
+            <option value="mp4">MP4 (H.264) — Safari</option>
+            <option value="webm">WebM (VP9) — Chrome / Firefox</option>
+          </select>
+          <span class="form__field-hint" id="exportFormatHint"></span>
+        </div>
+      </div>
+      <div class="modal__actions">
+        <button type="button" class="btn modal__cancel" id="exportModalCancel">取消</button>
+        <button type="button" class="btn modal__confirm" id="exportModalConfirm">开始录制</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
