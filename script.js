@@ -19,6 +19,9 @@ const state = {
   groupIsPlaying: false,
   compareIsPlaying: false,
   compareGroupId: null,
+  // Remember where the user came from before entering compare view
+  compareSourceView: 'groups',
+  compareSourceGroupId: null,
   // Per-group compare slot storage — exposed via getter/setter below
   _compareByGroup: {},
 };
@@ -173,6 +176,8 @@ async function loadAllData() {
     if (v.fps === undefined) v.fps = null;
     if (v.useProxy === undefined) v.useProxy = false;
     if (v.fileSize === undefined) v.fileSize = null;
+    if (v.fileType === undefined) v.fileType = '';
+    if (v.originalName === undefined) v.originalName = '';
     if (!videoMap[v.groupId]) videoMap[v.groupId] = [];
     videoMap[v.groupId].push(v);
   });
@@ -222,6 +227,37 @@ async function deleteGroupFromDB(groupId) {
   });
 }
 
+/**
+ * Recursively delete a group and ALL its descendants:
+ * - Child groups (recursive)
+ * - Videos (blob URLs revoked + DB rows removed)
+ * - Compare state cleaned up
+ */
+async function deleteGroupCascade(groupId) {
+  const group = findGroup(groupId);
+  if (!group) return;
+
+  // 1. Recursively delete all child groups first
+  const children = getChildGroups(groupId);
+  for (const child of children) {
+    await deleteGroupCascade(child.id);
+  }
+
+  // 2. Clean up all videos in this group
+  for (const video of group.videos) {
+    if (video.url) URL.revokeObjectURL(video.url);
+    if (video.renderedUrl) URL.revokeObjectURL(video.renderedUrl);
+    await deleteVideoFromDB(video.id);
+  }
+
+  // 3. Remove from state and compare storage
+  state.groups = state.groups.filter(g => g.id !== groupId);
+  delete state._compareByGroup[groupId];
+
+  // 4. Delete group from IndexedDB
+  await deleteGroupFromDB(groupId);
+}
+
 async function persistVideo(videoItem, blob) {
   const db = await openDB();
   const tx = db.transaction('videos', 'readwrite');
@@ -239,6 +275,8 @@ async function persistVideo(videoItem, blob) {
     fps: videoItem.fps || null,
     useProxy: videoItem.useProxy || false,
     fileSize: videoItem.fileSize || null,
+    fileType: videoItem.fileType || '',
+    originalName: videoItem.originalName || '',
     blob: blob,
   });
   return new Promise((resolve, reject) => {
@@ -618,8 +656,9 @@ function navigate(view, groupId) {
     exitCompareFullscreen();
   }
 
-  // Remember the group we're coming from before switching views
+  // Remember the group and view we're coming from before switching views
   const previousGroupId = state.activeGroupId;
+  const previousView = state.activeView;
 
   state.activeView = view;
   state.activeGroupId = groupId || null;
@@ -645,6 +684,9 @@ function navigate(view, groupId) {
     renderGroupDetail();
   } else if (view === 'compare') {
     navBreadcrumb.textContent = '对比视图';
+    // Remember where we came from so the back button can return to it
+    state.compareSourceView = previousView;
+    state.compareSourceGroupId = previousGroupId;
     // When coming from a group page, switch to that group's videos
     if (previousGroupId && findGroup(previousGroupId)) {
       state.compareGroupId = previousGroupId;
@@ -656,6 +698,15 @@ function navigate(view, groupId) {
 }
 
 navBack.addEventListener('click', () => {
+  if (state.activeView === 'compare') {
+    // Go back to the page the user came from
+    if (state.compareSourceView === 'group' && state.compareSourceGroupId && findGroup(state.compareSourceGroupId)) {
+      navigate('group', state.compareSourceGroupId);
+    } else {
+      navigate('groups');
+    }
+    return;
+  }
   if (state.activeView === 'group') {
     const group = findGroup(state.activeGroupId);
     if (group && group.parentId) {
@@ -921,21 +972,19 @@ function createGroupCard(group, index) {
   deleteBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (card._editing) return;
-    const childGroups = getChildGroups(group.id);
-    if (childGroups.length > 0) {
-      showToast('请先删除该分组内的所有子分组', 'error');
-      return;
+    const totalVideos = getGroupVideoCount(group);
+    const subCount = getSubGroupCount(group);
+    let msg = `确定要删除分组「${group.name}」吗？`;
+    if (totalVideos > 0 || subCount > 0) {
+      const parts = [];
+      if (totalVideos > 0) parts.push(`${totalVideos} 个视频`);
+      if (subCount > 0) parts.push(`${subCount} 个子分组`);
+      msg += `\n将同时删除其中的 ${parts.join(' 和 ')}。`;
     }
-    if (group.videos.length > 0) {
-      showToast('请先清空分组中的视频再删除', 'error');
-      return;
-    }
-    showConfirmDialog('确认删除', `确定要删除分组「${group.name}」吗？此操作不可撤销。`, async () => {
-      state.groups = state.groups.filter(g => g.id !== group.id);
-      delete state._compareByGroup[group.id];
-      await deleteGroupFromDB(group.id);
+    msg += `\n此操作不可撤销。`;
+    showConfirmDialog('确认删除', msg, async () => {
+      await deleteGroupCascade(group.id);
       showToast(`「${group.name}」已删除`);
-      // Decide where to navigate after deletion
       if (state.activeGroupId === group.id) {
         navigate('groups');
       } else {
@@ -1204,19 +1253,18 @@ function createSubGroupCard(group, index) {
   deleteBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (card._editing || card._dragging) return;
-    const childGroups = getChildGroups(group.id);
-    if (childGroups.length > 0) {
-      showToast('请先删除该分组内的所有子分组', 'error');
-      return;
+    const totalVideos = getGroupVideoCount(group);
+    const subCount = getSubGroupCount(group);
+    let msg = `确定要删除子分组「${group.name}」吗？`;
+    if (totalVideos > 0 || subCount > 0) {
+      const parts = [];
+      if (totalVideos > 0) parts.push(`${totalVideos} 个视频`);
+      if (subCount > 0) parts.push(`${subCount} 个子分组`);
+      msg += `\n将同时删除其中的 ${parts.join(' 和 ')}。`;
     }
-    if (group.videos.length > 0) {
-      showToast('请先清空分组中的视频再删除', 'error');
-      return;
-    }
-    showConfirmDialog('确认删除', `确定要删除子分组「${group.name}」吗？此操作不可撤销。`, async () => {
-      state.groups = state.groups.filter(g => g.id !== group.id);
-      delete state._compareByGroup[group.id];
-      await deleteGroupFromDB(group.id);
+    msg += `\n此操作不可撤销。`;
+    showConfirmDialog('确认删除', msg, async () => {
+      await deleteGroupCascade(group.id);
       showToast(`「${group.name}」已删除`);
       if (state.activeGroupId === group.id) {
         navigate('groups');
@@ -1254,20 +1302,21 @@ groupMasterPlayBtn.addEventListener('click', () => {
 $('#deleteGroupBtn').addEventListener('click', async () => {
   const group = findGroup(state.activeGroupId);
   if (!group) return;
-  // Check for sub-groups
-  if (getChildGroups(group.id).length > 0) {
-    showToast('请先删除该分组内的所有子分组', 'error');
-    return;
+  const totalVideos = getGroupVideoCount(group);
+  const subCount = getSubGroupCount(group);
+  let msg = `确定要删除分组「${group.name}」吗？`;
+  if (totalVideos > 0 || subCount > 0) {
+    const parts = [];
+    if (totalVideos > 0) parts.push(`${totalVideos} 个视频`);
+    if (subCount > 0) parts.push(`${subCount} 个子分组`);
+    msg += `\n将同时删除其中的 ${parts.join(' 和 ')}。`;
   }
-  if (group.videos.length > 0) {
-    showToast('请先清空分组中的视频再删除', 'error');
-    return;
-  }
-  state.groups = state.groups.filter(g => g.id !== group.id);
-  delete state._compareByGroup[group.id];
-  await deleteGroupFromDB(group.id);
-  showToast(`「${group.name}」已删除`);
-  navigate('groups');
+  msg += `\n此操作不可撤销。`;
+  showConfirmDialog('确认删除', msg, async () => {
+    await deleteGroupCascade(group.id);
+    showToast(`「${group.name}」已删除`);
+    navigate('groups');
+  });
 });
 
 $('#renameGroupBtn').addEventListener('click', async () => {
@@ -1306,6 +1355,71 @@ btnNewSubGroup.addEventListener('click', () => {
 // ============================================
 // Audio Alignment Engine (cross-correlation)
 // ============================================
+
+// ---- Utility helpers ----
+
+/**
+ * Remove DC offset from audio samples (subtract mean).
+ * DC offset can skew energy envelope computation across devices.
+ */
+function removeDC(samples) {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) sum += samples[i];
+  const mean = sum / samples.length;
+  if (Math.abs(mean) < 1e-8) return samples; // already zero-mean
+  const result = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) result[i] = samples[i] - mean;
+  return result;
+}
+
+/**
+ * Compute onset-strength envelope from an energy envelope.
+ * Onsets (frame-to-frame energy increases) capture transient timing
+ * and are more robust to device-level differences than raw energy.
+ * Returns a new Float32Array of same length — each value is the
+ * positive energy increase from the previous frame.
+ */
+function computeOnsetEnvelope(energies) {
+  const onsets = new Float32Array(energies.length);
+  onsets[0] = 0;
+  for (let i = 1; i < energies.length; i++) {
+    onsets[i] = Math.max(0, energies[i] - energies[i - 1]);
+  }
+  return onsets;
+}
+
+/**
+ * Robust cross-correlation wrapper: tries energy envelope first,
+ * falls back to onset-strength envelope when the energy score is weak.
+ * Onset-based correlation is more resilient to microphone / codec
+ * differences between iPhone and Android recordings.
+ *
+ * @returns {{ offset: number, score: number, method: string }}
+ */
+function correlateEnvelopesRobust(refEnv, tgtEnv, windowRate, maxDriftSecs = 120) {
+  // 1. Try standard energy correlation first
+  const energyResult = correlateEnvelopes(refEnv, tgtEnv, windowRate, maxDriftSecs);
+
+  if (energyResult.score >= 0.25) {
+    return { ...energyResult, method: 'energy' };
+  }
+
+  // 2. Energy correlation is weak — try onset-strength envelope
+  const refOnsets = computeOnsetEnvelope(refEnv.energies);
+  const tgtOnsets = computeOnsetEnvelope(tgtEnv.energies);
+
+  const onsetRefEnv = { energies: refOnsets, windowRate: refEnv.windowRate };
+  const onsetTgtEnv = { energies: tgtOnsets, windowRate: tgtEnv.windowRate };
+
+  const onsetResult = correlateEnvelopes(onsetRefEnv, onsetTgtEnv, windowRate, maxDriftSecs);
+
+  if (onsetResult.score > energyResult.score) {
+    console.log(`[AudioAlign]   能量相关弱(${energyResult.score.toFixed(3)}) → 改用起音包络: ${onsetResult.score.toFixed(3)}`);
+    return { ...onsetResult, method: 'onset' };
+  }
+
+  return { ...energyResult, method: 'energy' };
+}
 
 /**
  * Extract a mono audio sample from a video blob URL.
@@ -1346,6 +1460,140 @@ async function extractAudioSample(videoUrl, sampleSecs = 12) {
     return null;
   } finally {
     if (audioCtx) audioCtx.close();
+  }
+}
+
+/**
+ * Fallback audio extraction using a <video> element + Web Audio API.
+ *
+ * Some Android devices (e.g. Vivo, Xiaomi, Samsung mid-range) fail at
+ * `decodeAudioData()` when fed a full video container — the system media
+ * codec either rejects the format or runs out of memory.  The <video>
+ * element uses the browser's full media pipeline (demuxer + decoder) and
+ * is far more robust across manufacturers.
+ *
+ * We play the video silently, capture its audio output through a
+ * ScriptProcessorNode, and return the same { samples, sampleRate } shape
+ * as extractAudioSample.
+ */
+async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
+  const video = document.createElement('video');
+  video.src = videoUrl;
+  video.muted = false;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.volume = 0;          // silent playback
+
+  let audioCtx = null;
+
+  try {
+    // Wait for the video element to parse the container / load metadata
+    await new Promise((resolve, reject) => {
+      video.addEventListener('loadedmetadata', resolve, { once: true });
+      video.addEventListener('error', () => reject(new Error('video load error')), { once: true });
+    });
+
+    const duration = Math.min(video.duration || 30, sampleSecs);
+    const captureSecs = Math.min(duration, 300); // cap at 5 min for memory safety
+
+    // --- Start playback ---
+    video.currentTime = 0;
+    try {
+      await video.play();
+    } catch (playErr) {
+      console.warn('[AudioAlign] 视频元素回退：play() 被拒绝:', playErr.message);
+      return null;
+    }
+
+    // --- Capture audio via captureStream() + MediaRecorder ---
+    // This taps into the video's decoded audio output directly, bypassing
+    // the Web Audio graph entirely. More reliable than createMediaElementSource
+    // + ScriptProcessorNode, especially on file:// origins.
+    const stream = video.captureStream();
+    const audioTracks = stream.getAudioTracks();
+
+    if (audioTracks.length === 0) {
+      console.warn('[AudioAlign] 视频元素回退：captureStream 无音轨 — 视频可能没有音频');
+      return null;
+    }
+
+    // Create an audio-only stream
+    const audioStream = new MediaStream(audioTracks);
+
+    // Try audio/webm first (Chromium), fall back to browser default
+    let mimeType = '';
+    for (const candidate of ['audio/webm', 'audio/webm;codecs=opus', 'audio/mp4']) {
+      if (MediaRecorder.isTypeSupported(candidate)) {
+        mimeType = candidate;
+        break;
+      }
+    }
+
+    const chunks = [];
+    const recorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+
+    const recorderStopped = new Promise((resolve) => {
+      recorder.onstop = resolve;
+    });
+
+    recorder.start();
+
+    // Record for the target duration
+    await new Promise(r => setTimeout(r, captureSecs * 1000));
+
+    // Request final data chunk and stop
+    recorder.requestData();
+    recorder.stop();
+    video.pause();
+
+    // Wait for the final dataavailable / stop event
+    await recorderStopped;
+
+    // Detach audio tracks
+    audioTracks.forEach(t => t.stop());
+
+    if (chunks.length === 0) {
+      console.warn('[AudioAlign] 视频元素回退：MediaRecorder 未产生数据');
+      return null;
+    }
+
+    const audioBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+    const arrayBuffer = await audioBlob.arrayBuffer();
+
+    audioCtx = new AudioContext();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+    const sampleRate = audioBuffer.sampleRate;
+    const totalSamples = audioBuffer.length;
+    const mono = new Float32Array(totalSamples);
+
+    if (audioBuffer.numberOfChannels === 1) {
+      mono.set(audioBuffer.getChannelData(0));
+    } else {
+      for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+        const data = audioBuffer.getChannelData(c);
+        for (let i = 0; i < totalSamples; i++) {
+          mono[i] += data[i] / audioBuffer.numberOfChannels;
+        }
+      }
+    }
+
+    console.log(`[AudioAlign] 视频元素回退成功: ${(mono.length / sampleRate).toFixed(1)}s, ${sampleRate}Hz`);
+    return { samples: mono, sampleRate, _fallback: true };
+
+  } catch (err) {
+    console.warn('[AudioAlign] 视频元素回退失败:', err.message);
+    return null;
+  } finally {
+    if (audioCtx) audioCtx.close();
+    video.pause();
+    video.src = '';
+    video.remove();
   }
 }
 
@@ -1504,22 +1752,47 @@ async function performAudioAlignment() {
   showToast('正在提取音频、检测内容边界并对齐…');
 
   try {
-    // --- Phase 1: extract audio from all filled slots ---
-    const audioData = [];
-    for (const slot of filled) {
+    // --- Phase 1: extract audio from all filled slots (CONCURRENT) ---
+    // CRITICAL: All extractions start simultaneously so that the fallback
+    // method's video.play() calls all happen within Chrome's ~5 s user-gesture
+    // window.  A sequential loop would push later slots past the deadline.
+    // See [[android-audio-user-gesture-bug]] for the full history.
+    const extractionResults = await Promise.all(filled.map(async (slot) => {
       const result = findVideo(slot.videoId);
-      if (!result) { audioData.push(null); continue; }
-      const extracted = await extractAudioSample(result.video.url, 300);
+      if (!result) return null;
+
+      const fileSizeMB = (result.video.fileSize || 0) / (1024 * 1024);
+
+      // Large files (> 50 MB): skip primary method — fetching the entire blob
+      // for decodeAudioData would be too slow / memory-heavy.
+      let extracted = null;
+      if (fileSizeMB <= 50) {
+        extracted = await extractAudioSample(result.video.url, 300);
+      } else {
+        console.log(`[AudioAlign] 槽位 ${slot.slotIdx}: 文件较大 (${fileSizeMB.toFixed(0)} MB)，跳过主方法，直接使用回退方案`);
+      }
+
+      // Fallback for Android / Vivo: <video> element + Web Audio API
+      // (decodeAudioData often fails on Android system decoders for video containers)
+      if (!extracted) {
+        if (fileSizeMB <= 50) {
+          console.log(`[AudioAlign] 槽位 ${slot.slotIdx}: 主方法失败，尝试视频元素回退方案…`);
+        }
+        extracted = await extractAudioViaVideoElement(result.video.url, 300);
+      }
+
       if (extracted) {
         extracted.slotIdx = slot.slotIdx;
         extracted.video = result.video;
-        audioData.push(extracted);
-        console.log(`[AudioAlign] 槽位 ${slot.slotIdx} 音频提取成功: ${(extracted.samples.length / extracted.sampleRate).toFixed(1)}s, ${extracted.sampleRate}Hz`);
+        const method = extracted._fallback ? '(视频元素回退)' : '';
+        console.log(`[AudioAlign] 槽位 ${slot.slotIdx} 音频提取成功${method}: ${(extracted.samples.length / extracted.sampleRate).toFixed(1)}s, ${extracted.sampleRate}Hz`);
       } else {
-        console.warn(`[AudioAlign] 槽位 ${slot.slotIdx} 音频提取失败（视频可能无音轨）`);
-        audioData.push(null);
+        console.warn(`[AudioAlign] 槽位 ${slot.slotIdx} 音频提取失败（所有方法均失败，视频可能无音轨）`);
       }
-    }
+      return extracted;
+    }));
+
+    const audioData = extractionResults;
 
     const valid = audioData.filter(d => d !== null && d.samples && d.samples.length > 0);
     if (valid.length < 1) {
@@ -1533,6 +1806,8 @@ async function performAudioAlignment() {
     let hasAudibleCount = 0;
 
     for (const data of valid) {
+      // Remove DC offset — DC can skew RMS energy differently on each device
+      data.samples = removeDC(data.samples);
       data.env = computeEnergyEnvelope(data.samples, data.sampleRate, 200);
       const peakEnergy = data.env.energies.length > 0 ? Math.max(...data.env.energies) : 0;
       const videoDur = data.samples.length / data.sampleRate;
@@ -1540,11 +1815,13 @@ async function performAudioAlignment() {
       if (peakEnergy < SILENT_THRESHOLD) {
         // Video has no audible audio — can't detect silence or correlate
         data.isSilent = true;
+        data.peakEnergy = peakEnergy;
         data.contentStart = 0;
         data.contentEnd = videoDur;
         console.warn(`[AudioAlign] 槽位 ${data.slotIdx}: ⚠️ 视频无声（峰值能量=${(peakEnergy*1000).toFixed(3)}e-3 < ${(SILENT_THRESHOLD*1000).toFixed(1)}e-3），将跳过音频相关`);
       } else {
         data.isSilent = false;
+        data.peakEnergy = peakEnergy;
         hasAudibleCount++;
         // Fine envelope for silence detection (50ms)
         const fineEnv = computeEnergyEnvelope(data.samples, data.sampleRate, 50);
@@ -1562,20 +1839,58 @@ async function performAudioAlignment() {
       return;
     }
 
-    // --- Phase 3: cross-correlate energy envelopes (only between audible videos) ---
+    // --- Phase 3: cross-correlate energy envelopes ---
+    // Strategy: pick the top-5 videos with highest peak energy as reference
+    // candidates. Use #1 as primary reference; correlate every other video
+    // against ALL top-5 candidates and pick the best-matching one.
     const audible = valid.filter(d => !d.isSilent);
     const corrOffsets = new Array(COMPARE_SLOTS).fill(0);
 
     if (audible.length >= 2) {
-      const ref = audible[0];
-      corrOffsets[ref.slotIdx] = 0;
+      // Sort by peak energy descending → clearest audio first
+      const sortedByPeak = [...audible].sort((a, b) => b.peakEnergy - a.peakEnergy);
+      const top5 = sortedByPeak.slice(0, Math.min(5, sortedByPeak.length));
+      const primaryRef = top5[0]; // absolute highest peak
 
-      for (let i = 1; i < audible.length; i++) {
-        const tgt = audible[i];
-        const avgRate = (ref.env.windowRate + tgt.env.windowRate) / 2;
-        const result = correlateEnvelopes(ref.env, tgt.env, avgRate, 120);
+      console.log(`[AudioAlign] 🔍 波峰最高的前 ${top5.length} 个视频作为参考基准：`);
+      top5.forEach((d, i) => {
+        console.log(`  ${i + 1}. 槽位${d.slotIdx} (video=${d.video?.title || '?'}) 峰值能量=${(d.peakEnergy * 1000).toFixed(1)}e-3`);
+      });
+
+      // Round 1: correlate each non-primary top-5 reference against the primary
+      for (let i = 1; i < top5.length; i++) {
+        const tgt = top5[i];
+        const avgRate = (primaryRef.env.windowRate + tgt.env.windowRate) / 2;
+        const result = correlateEnvelopesRobust(primaryRef.env, tgt.env, avgRate, 120);
         corrOffsets[tgt.slotIdx] = result.offset;
-        console.log(`[AudioAlign] 包络相关 槽位${tgt.slotIdx} vs 槽位${ref.slotIdx}: 偏移=${result.offset.toFixed(3)}s, 相关系数=${result.score.toFixed(3)} (${result.score > 0.3 ? '可信' : result.score > 0.1 ? '弱匹配' : '不可靠'})`);
+        console.log(`[AudioAlign] 参考#${i + 1}(槽位${tgt.slotIdx}) vs 主参考(槽位${primaryRef.slotIdx}): 偏移=${result.offset.toFixed(3)}s, 相关系数=${result.score.toFixed(3)} (${result.score > 0.3 ? '可信' : result.score > 0.1 ? '弱' : '不可靠'})`);
+      }
+
+      // Round 2: for each remaining video, try all top-5 refs → pick best
+      const remaining = audible.filter(d => !top5.includes(d));
+      for (const tgt of remaining) {
+        let bestScore = -Infinity;
+        let bestTotalOffset = 0;
+        let bestRefSlot = -1;
+
+        for (const ref of top5) {
+          const avgRate = (ref.env.windowRate + tgt.env.windowRate) / 2;
+          const result = correlateEnvelopesRobust(ref.env, tgt.env, avgRate, 120);
+          // Chain: ref's own offset from primary + tgt's offset from ref
+          const totalOffset = (corrOffsets[ref.slotIdx] || 0) + result.offset;
+
+          console.log(`[AudioAlign]   槽位${tgt.slotIdx} vs 参考槽位${ref.slotIdx}: 相对偏移=${result.offset.toFixed(3)}s, 总偏移=${totalOffset.toFixed(3)}s, 相关系数=${result.score.toFixed(3)}`);
+
+          if (result.score > bestScore) {
+            bestScore = result.score;
+            bestTotalOffset = totalOffset;
+            bestRefSlot = ref.slotIdx;
+          }
+        }
+
+        corrOffsets[tgt.slotIdx] = bestTotalOffset;
+        const reliable = bestScore > 0.3 ? '✓可信' : bestScore > 0.1 ? '△弱匹配' : '✗不可靠';
+        console.log(`[AudioAlign] 槽位${tgt.slotIdx} → 最佳匹配: 参考槽位${bestRefSlot} (得分=${bestScore.toFixed(3)} ${reliable}), 最终偏移=${bestTotalOffset.toFixed(3)}s`);
       }
     } else {
       // Only one audible video — can't cross-correlate, just trim its silence
@@ -1626,16 +1941,39 @@ async function performAudioAlignment() {
       }
     }
 
+    // --- Compute playback duration: shortest remaining video after seek ---
+    // Instead of using the intersection of content windows (which can be very short),
+    // use the video that runs out first as the common playback duration.
+    // This gives a much longer synchronized playback experience.
+    let commonDurationFromRemaining = Infinity;
+    for (const data of valid) {
+      const videoDuration = data.video?.duration;
+      if (videoDuration && videoDuration > 0) {
+        const remaining = videoDuration - offsets[data.slotIdx];
+        if (remaining > 0 && remaining < commonDurationFromRemaining) {
+          commonDurationFromRemaining = remaining;
+        }
+      }
+    }
+    // Fall back to content-window intersection if we couldn't determine remaining durations
+    if (!isFinite(commonDurationFromRemaining) || commonDurationFromRemaining <= 0) {
+      commonDurationFromRemaining = commonEnd - commonStart;
+      console.log(`[AudioAlign] 无法获取视频时长，回退到内容窗口交集: ${commonDurationFromRemaining.toFixed(2)}s`);
+    }
+    const commonDurationFinal = commonDurationFromRemaining;
+    console.log(`[AudioAlign] 播放时长（最短剩余视频）: ${commonDurationFinal.toFixed(2)}s (内容窗口交集为 ${(commonEnd - commonStart).toFixed(2)}s)`);
+
     state.compareOffsets = offsets;
-    state.compareDuration = commonDuration;
+    state.compareDuration = commonDurationFinal;
 
     // --- Show result ---
     const silentCount = valid.length - audible.length;
-    let msg = `对齐完成：${audible.length} 个有声视频已处理`;
+    const top5Count = Math.min(5, audible.length);
+    let msg = `对齐完成：以波峰最高的 ${top5Count} 个视频为基准`;
     if (silentCount > 0) {
       msg += `（${silentCount} 个视频无音频，跳过互相关）`;
     }
-    msg += `，共同片段 ${commonDuration.toFixed(1)}s`;
+    msg += `，同步播放 ${commonDurationFinal.toFixed(1)}s`;
     showToast(msg, 'success');
 
     btnAlignAudio.classList.remove('is-processing');
@@ -1677,6 +2015,65 @@ function clearAudioAlignment() {
     </svg>
     音频对齐`;
 }
+
+/**
+ * Debug / test helper — call from the browser console:
+ *   await debugAlignGroup('夕阳拍摄')
+ *
+ * Loads all videos from the named group into compare slots and runs the
+ * alignment, printing detailed per-slot diagnostics (including extraction
+ * method, correlation scores, and whether onset fallback was used).
+ */
+async function debugAlignGroup(groupName) {
+  // 1. Find group by name (case-insensitive substring match)
+  const group = state.groups.find(g => g.name.toLowerCase().includes(groupName.toLowerCase()));
+  if (!group) {
+    console.error(`[DebugAlign] 未找到包含 "${groupName}" 的分组`);
+    console.log('可用的分组:', state.groups.map(g => g.name));
+    return;
+  }
+  console.log(`[DebugAlign] 找到分组: "${group.name}" (id=${group.id}), ${group.videos.length} 个视频`);
+
+  // 2. Navigate to compare view targeting this group
+  state.compareGroupId = group.id;
+  navigate('compare', group.id);
+
+  // 3. Fill compare slots with videos from the group
+  const slotsToFill = Math.min(group.videos.length, COMPARE_SLOTS);
+  for (let i = 0; i < slotsToFill; i++) {
+    state.compareSlots[i] = group.videos[i].id;
+    console.log(`[DebugAlign] 槽位 ${i}: "${group.videos[i].title}" (${group.videos[i].originalName || '?'}) size=${(group.videos[i].fileSize / 1048576).toFixed(1)}MB`);
+  }
+  for (let i = slotsToFill; i < COMPARE_SLOTS; i++) {
+    state.compareSlots[i] = null;
+  }
+
+  // Compare state is auto-saved via property setters when compareGroupId is set
+  // (state.compareSlots is a property proxy to _compareByGroup[gid].slots)
+
+  // 4. Render compare view and run alignment
+  renderCompareView();
+
+  // Small delay so the UI settles
+  await new Promise(r => setTimeout(r, 300));
+
+  console.log(`[DebugAlign] 开始音频对齐 (${slotsToFill} 个视频)…`);
+  console.log(`[DebugAlign] 算法: 并发提取 + DC去除 + 起音包络回退 (当能量相关 < 0.25 时)`);
+
+  const startTime = performance.now();
+  await performAudioAlignment();
+  const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+
+  // 5. Print results summary
+  console.log(`[DebugAlign] ✅ 对齐完成 (耗时 ${elapsed}s)`);
+  console.log('[DebugAlign] 最终 seek 位置:', state.compareOffsets);
+  console.log('[DebugAlign] 共同片段时长:', state.compareDuration?.toFixed(2) + 's');
+  console.log('[DebugAlign] 💡 提示: 在浏览器中播放以验证对齐效果，查看控制台获取各槽位详情');
+}
+
+// Expose for console use
+window.debugAlignGroup = debugAlignGroup;
+console.log('[Dev] 调试函数已就绪 — 在控制台输入 await debugAlignGroup("夕阳拍摄") 进行测试');
 
 function updateRenderButtonState() {
   const filled = state.compareSlots.filter(s => s !== null);
@@ -2709,7 +3106,8 @@ function syncFullscreenPlayBtn() {
 let fullscreenExportBtn = null;
 let exportRecorder = null;
 let exportRecording = false;
-let exportRecordingIndicator = null;
+let exportProgressEl = null;
+let _exportProgressDone = false;
 
 // DOM refs for export modal
 const exportModalOverlay = $('#exportModalOverlay');
@@ -2724,6 +3122,13 @@ const exportFpsCustomRow = $('#exportFpsCustomRow');
 const exportCustomFps = $('#exportCustomFps');
 const exportFormat = $('#exportFormat');
 const exportFormatHint = $('#exportFormatHint');
+const exportShowNames = $('#exportShowNames');
+const exportModeButtons = $$('#exportModeSwitch .mode-switch__btn');
+const exportCompositeOptions = $('#exportCompositeOptions');
+const exportIndividualInfo = $('#exportIndividualInfo');
+const exportIndividualCount = $('#exportIndividualCount');
+
+let exportMode = 'composite'; // 'composite' | 'individual'
 
 function getGridLayout(count) {
   if (count <= 1) return { cols: 1, rows: 1 };
@@ -2760,12 +3165,40 @@ function openExportModal() {
 
   exportFramerate.value = 'auto';
 
+  // Count individual export videos
+  const filledCount = state.compareSlots.filter(s => s !== null).length;
+  exportIndividualCount.textContent = filledCount > 0 ? `${filledCount} 个视频` : '单独导出';
+
+  // Reset to composite mode
+  setExportMode('composite');
+
   exportModalOverlay.style.display = 'flex';
 }
 
 function closeExportModal() {
   exportModalOverlay.style.display = 'none';
 }
+
+// Export mode switcher
+function setExportMode(mode) {
+  exportMode = mode;
+  exportModeButtons.forEach(btn => {
+    btn.classList.toggle('mode-switch__btn--active', btn.dataset.mode === mode);
+  });
+  if (mode === 'composite') {
+    exportCompositeOptions.style.display = '';
+    exportIndividualInfo.style.display = 'none';
+    exportModalConfirm.textContent = '开始导出';
+  } else {
+    exportCompositeOptions.style.display = 'none';
+    exportIndividualInfo.style.display = '';
+    exportModalConfirm.textContent = '全部导出';
+  }
+}
+
+exportModeButtons.forEach(btn => {
+  btn.addEventListener('click', () => setExportMode(btn.dataset.mode));
+});
 
 exportResolution.addEventListener('change', () => {
   const showCustom = exportResolution.value === 'custom';
@@ -2853,16 +3286,30 @@ async function startExportRecording() {
   }
 
   const videos = [];
+  const videoTitles = []; // parallel array of video titles
   const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
   slotEls.forEach(slotEl => {
     const video = slotEl.querySelector('video');
-    if (video) videos.push(video);
+    if (video) {
+      videos.push(video);
+      // Resolve title from compare slot video ID
+      const slotIdx = parseInt(slotEl.dataset.slot);
+      const videoId = state.compareSlots[slotIdx];
+      if (videoId) {
+        const result = findVideo(videoId);
+        videoTitles.push(result ? result.video.title : '');
+      } else {
+        videoTitles.push('');
+      }
+    }
   });
 
   if (videos.length === 0) {
     showToast('没有找到视频元素', 'error');
     return;
   }
+
+  const showNames = exportShowNames.checked;
 
   closeExportModal();
 
@@ -2914,6 +3361,40 @@ async function startExportRecording() {
       const dy = y + (cellH - dh) / 2;
 
       ctx.drawImage(video, dx, dy, dw, dh);
+
+      // Draw video name in bottom-right corner if enabled
+      if (showNames && videoTitles[i]) {
+        const title = videoTitles[i];
+        // Calculate font size proportional to cell height
+        const fontSize = Math.max(12, Math.min(28, cellH * 0.055));
+        ctx.save();
+        ctx.font = `600 ${fontSize}px "Noto Serif SC", "PingFang SC", sans-serif`;
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'bottom';
+
+        // Semi-transparent background behind text for readability
+        const metrics = ctx.measureText(title);
+        const textW = metrics.width;
+        const textH = fontSize * 1.3;
+        const padX = fontSize * 0.5;
+        const padY = fontSize * 0.25;
+        const bgX = x + cellW - textW - padX * 2;
+        const bgY = y + cellH - textH - padY * 2;
+        const bgW = textW + padX * 2;
+        const bgH = textH + padY * 2;
+
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.beginPath();
+        ctx.roundRect(bgX, bgY, bgW, bgH, 4);
+        ctx.fill();
+
+        // Draw text shadow for depth
+        ctx.fillStyle = 'rgba(255,255,255,0.92)';
+        ctx.shadowColor = 'rgba(0,0,0,0.5)';
+        ctx.shadowBlur = 4;
+        ctx.fillText(title, x + cellW - padX, y + cellH - padY);
+        ctx.restore();
+      }
     }
   }
 
@@ -2945,18 +3426,36 @@ async function startExportRecording() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     showToast(`导出完成：${resolution.w}×${resolution.h} ${fps}fps .${ext}`);
-    cleanupExport();
+    // Keep the "done" state visible briefly before cleanup
+    setTimeout(() => cleanupExport(), 2500);
   };
 
   recorder.onerror = () => {
-    showToast('录制失败', 'error');
+    showToast('导出失败', 'error');
     cleanupExport();
   };
 
-  // Animation loop to feed frames
+  // Animation loop to feed frames + track progress
   let animId;
-  let frameInterval = 1000 / fps;
+  const frameInterval = 1000 / fps;
   let lastFrameTime = 0;
+
+  // Find the longest video duration for progress tracking
+  const offsets = state.compareOffsets || [];
+  let maxEndTime = 0;
+  videos.forEach((v, i) => {
+    const dur = v.duration || 0;
+    const offset = offsets[i] || 0;
+    const endTime = Math.min(offset + dur, dur || Infinity);
+    if (endTime > maxEndTime) maxEndTime = endTime;
+  });
+  // If we couldn't determine duration, fall back to a reasonable estimate
+  if (!maxEndTime || !isFinite(maxEndTime)) maxEndTime = 30;
+
+  // Determine whether all videos have ended
+  function allEnded() {
+    return videos.every(v => v.ended || (v.paused && v.currentTime >= (v.duration || 0) - 0.15));
+  }
 
   function animLoop(timestamp) {
     if (!exportRecording) return;
@@ -2964,11 +3463,24 @@ async function startExportRecording() {
       drawFrame();
       lastFrameTime = timestamp;
     }
+    // Track progress: use the longest-duration video's currentTime
+    if (videos.length > 0 && maxEndTime > 0) {
+      const cur = Math.max(...videos.map(v => v.currentTime || 0));
+      updateExportProgress((cur / maxEndTime) * 100);
+    }
+    // Auto-stop when all videos have finished
+    if (allEnded()) {
+      exportRecording = false;
+      if (exportRecorder && exportRecorder.state === 'recording') {
+        exportRecorder.stop();
+      }
+      showExportDone();
+      return;
+    }
     animId = requestAnimationFrame(animLoop);
   }
 
   // Seek all videos to start (apply alignment offsets if available)
-  const offsets = state.compareOffsets || [];
   videos.forEach((v, i) => {
     const offset = offsets[i] || 0;
     v.currentTime = Math.max(0, offset);
@@ -2990,37 +3502,73 @@ async function startExportRecording() {
 
   animId = requestAnimationFrame(animLoop);
 
-  // Show recording indicator
-  showRecordingIndicator();
+  // Show export progress panel
+  showExportProgress();
 
   // Store cleanup refs
   exportRecorder._cleanupRefs = { canvas, stream, chunks, animId, videos };
 }
 
-function showRecordingIndicator() {
-  if (exportRecordingIndicator) return;
-  exportRecordingIndicator = document.createElement('div');
-  exportRecordingIndicator.className = 'compare__recording-indicator';
-  exportRecordingIndicator.innerHTML = `
-    <span class="compare__recording-dot"></span>
-    <span>正在录制合成视频…</span>
-    <button class="compare__recording-stop" id="exportStopBtn">■ 停止</button>
+function showExportProgress() {
+  if (exportProgressEl) return;
+  _exportProgressDone = false;
+  exportProgressEl = document.createElement('div');
+  exportProgressEl.className = 'compare__export-progress';
+  exportProgressEl.innerHTML = `
+    <div class="compare__export-progress-header">
+      <span class="compare__export-progress-label">
+        <span class="compare__export-progress-spinner"></span>
+        正在导出视频…
+      </span>
+      <span class="compare__export-progress-pct">0%</span>
+    </div>
+    <div class="compare__export-progress-track">
+      <div class="compare__export-progress-fill" id="exportProgressFill"></div>
+    </div>
+    <button class="compare__export-stop" id="exportStopBtn">取消导出</button>
   `;
-  document.body.appendChild(exportRecordingIndicator);
-  exportRecordingIndicator.querySelector('#exportStopBtn').addEventListener('click', stopExportRecording);
+  document.body.appendChild(exportProgressEl);
+  exportProgressEl.querySelector('#exportStopBtn').addEventListener('click', stopExportRecording);
 }
 
-function hideRecordingIndicator() {
-  if (exportRecordingIndicator) {
-    exportRecordingIndicator.remove();
-    exportRecordingIndicator = null;
+function updateExportProgress(pct) {
+  if (!exportProgressEl || _exportProgressDone) return;
+  const fill = exportProgressEl.querySelector('#exportProgressFill');
+  const pctEl = exportProgressEl.querySelector('.compare__export-progress-pct');
+  if (fill) fill.style.width = Math.min(100, Math.round(pct)) + '%';
+  if (pctEl) pctEl.textContent = Math.min(100, Math.round(pct)) + '%';
+}
+
+function showExportDone() {
+  if (!exportProgressEl || _exportProgressDone) return;
+  _exportProgressDone = true;
+  exportProgressEl.classList.add('compare__export-progress--done');
+  const label = exportProgressEl.querySelector('.compare__export-progress-label');
+  if (label) label.innerHTML = `
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="color:#5b8c5a">
+      <polyline points="20,6 9,17 4,12"/>
+    </svg>
+    导出完成
+  `;
+  updateExportProgress(100);
+  const stopBtn = exportProgressEl.querySelector('#exportStopBtn');
+  if (stopBtn) stopBtn.remove();
+  // Auto-dismiss after 2 seconds
+  setTimeout(() => hideExportProgress(), 2000);
+}
+
+function hideExportProgress() {
+  if (exportProgressEl) {
+    exportProgressEl.remove();
+    exportProgressEl = null;
   }
+  _exportProgressDone = false;
 }
 
 function stopExportRecording() {
   if (!exportRecording || !exportRecorder) return;
   exportRecording = false;
-  exportRecorder.stop();
+  if (exportRecorder.state === 'recording') exportRecorder.stop();
 
   // Pause videos
   const refs = exportRecorder._cleanupRefs;
@@ -3031,7 +3579,7 @@ function stopExportRecording() {
     cancelAnimationFrame(refs.animId);
   }
 
-  hideRecordingIndicator();
+  hideExportProgress();
 }
 
 function cleanupExport() {
@@ -3042,10 +3590,236 @@ function cleanupExport() {
   }
   exportRecorder = null;
   exportRecording = false;
-  hideRecordingIndicator();
+  hideExportProgress();
 }
 
-exportModalConfirm.addEventListener('click', startExportRecording);
+// --- Trim & encode a single video segment (used for aligned individual export) ---
+// Records [startSec, startSec+durationSec] at original resolution with high bitrate.
+async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title) {
+  const video = document.createElement('video');
+  video.src = videoUrl;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.muted = true;
+  video.playsInline = true;
+
+  await new Promise((resolve, reject) => {
+    video.addEventListener('loadedmetadata', resolve, { once: true });
+    video.addEventListener('error', reject, { once: true });
+  });
+
+  // Use original resolution
+  let w = video.videoWidth;
+  let h = video.videoHeight;
+  if (!w || !h || w === 0 || h === 0) {
+    w = 1920; h = 1080;
+  }
+  // Ensure even dimensions
+  w = w % 2 === 0 ? w : w + 1;
+  h = h % 2 === 0 ? h : h + 1;
+
+  // Detect native frame rate
+  let fps = 30;
+  const hasVFC = 'requestVideoFrameCallback' in video;
+  if (hasVFC) {
+    video.currentTime = Math.max(0, startSec);
+    await video.play();
+    let frameCount = 0;
+    const detectStart = performance.now();
+    await new Promise((resolve) => {
+      const onFrame = () => {
+        frameCount++;
+        if (performance.now() - detectStart >= 600) { resolve(); return; }
+        video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+    });
+    const elapsed = (performance.now() - detectStart) / 1000;
+    if (elapsed > 0 && frameCount > 0) {
+      fps = Math.max(10, Math.min(60, Math.round(frameCount / elapsed)));
+    }
+    video.pause();
+    // If the stored metadata has fps, prefer it
+    // (we'll use our detected fps as fallback)
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+
+  const stream = canvas.captureStream(fps);
+  // Try MP4 first (better compatibility), then webm
+  let mimeType;
+  if (MediaRecorder.isTypeSupported('video/mp4; codecs="avc1.42E01E"')) {
+    mimeType = 'video/mp4; codecs="avc1.42E01E"';
+  } else if (MediaRecorder.isTypeSupported('video/webm; codecs=vp9')) {
+    mimeType = 'video/webm; codecs=vp9';
+  } else if (MediaRecorder.isTypeSupported('video/webm; codecs=vp8')) {
+    mimeType = 'video/webm; codecs=vp8';
+  } else {
+    mimeType = 'video/webm';
+  }
+
+  // High bitrate for quality: scale based on resolution area
+  const area = w * h;
+  const bitrate = Math.max(8000000, Math.min(80000000, Math.round(area * fps * 0.3)));
+
+  const chunks = [];
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: bitrate });
+
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  };
+
+  // Seek to start position
+  video.currentTime = Math.max(0, startSec);
+  await new Promise(r => setTimeout(r, 300));
+
+  recorder.start(100);
+  await video.play();
+
+  // Draw loop — stop after durationSec
+  const startTime = performance.now();
+  const targetMs = durationSec * 1000;
+
+  await new Promise((resolve) => {
+    const drawLoop = () => {
+      if (video.ended || performance.now() - startTime >= targetMs) {
+        if (recorder.state === 'recording') recorder.stop();
+        resolve();
+        return;
+      }
+      if (video.readyState >= 2) {
+        ctx.drawImage(video, 0, 0, w, h);
+      }
+      requestAnimationFrame(drawLoop);
+    };
+    requestAnimationFrame(drawLoop);
+  });
+
+  // Ensure recorder is stopped
+  if (recorder.state === 'recording') {
+    await new Promise(r => setTimeout(r, 200));
+    if (recorder.state === 'recording') recorder.stop();
+  }
+
+  // Wait for final data
+  await new Promise((resolve) => {
+    recorder.onstop = () => resolve();
+  });
+
+  video.pause();
+  video.src = '';
+  stream.getTracks().forEach(t => t.stop());
+
+  if (chunks.length === 0) return null;
+
+  const blob = new Blob(chunks, { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const safeName = (title || 'video').replace(/[\\/:*?"<>|]/g, '_').trim() || 'video';
+  const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = safeName + '.' + ext;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Revoke after a short delay to ensure download starts
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+
+  return blob;
+}
+
+// --- Individual video export ---
+async function startIndividualExport() {
+  const filled = state.compareSlots
+    .map((videoId, i) => ({ videoId, slotIdx: i }))
+    .filter(s => s.videoId !== null);
+
+  if (filled.length === 0) {
+    showToast('没有可导出的视频', 'error');
+    return;
+  }
+
+  closeExportModal();
+  showExportProgress();
+
+  // Check if alignment is active
+  const offsets = state.compareOffsets || [];
+  const hasAlignment = state.compareDuration && state.compareDuration > 0
+    && offsets.some(o => o !== 0);
+  const commonDuration = hasAlignment ? state.compareDuration : null;
+
+  let completed = 0;
+  const total = filled.length;
+
+  for (const slot of filled) {
+    const result = findVideo(slot.videoId);
+    if (!result) { completed++; continue; }
+
+    const video = result.video;
+    updateExportProgress(Math.round((completed / total) * 100));
+
+    if (hasAlignment && commonDuration && commonDuration > 0) {
+      // Trimmed export — re-encode at original resolution
+      const offset = offsets[slot.slotIdx] || 0;
+      updateExportProgress(Math.round((completed / total) * 100));
+      // Update progress label to show current video
+      if (exportProgressEl) {
+        const label = exportProgressEl.querySelector('.compare__export-progress-label');
+        if (label) {
+          const spinner = label.querySelector('.compare__export-progress-spinner');
+          label.textContent = '';
+          if (spinner) label.appendChild(spinner);
+          label.appendChild(document.createTextNode(` 正在导出 (${completed + 1}/${total}): ${video.title}`));
+        }
+      }
+      await trimAndDownloadVideo(video.url, offset, commonDuration, video.title);
+    } else {
+      // No alignment — download original blob as-is, preserving original format
+      if (exportProgressEl) {
+        const label = exportProgressEl.querySelector('.compare__export-progress-label');
+        if (label) {
+          const spinner = label.querySelector('.compare__export-progress-spinner');
+          label.textContent = '';
+          if (spinner) label.appendChild(spinner);
+          label.appendChild(document.createTextNode(` 正在导出 (${completed + 1}/${total}): ${video.title}`));
+        }
+      }
+      const safeName = (video.title || 'video').replace(/[\\/:*?"<>|]/g, '_').trim() || 'video';
+      // Preserve original file extension
+      const origExt = (video.originalName || '').split('.').pop().toLowerCase();
+      const ext = origExt && origExt.length <= 5 ? '.' + origExt : '.mp4';
+      const a = document.createElement('a');
+      a.href = video.url;
+      a.download = safeName + ext;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      // Small delay between downloads
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    completed++;
+  }
+
+  updateExportProgress(100);
+  showExportDone();
+  const msg = hasAlignment
+    ? `已导出 ${completed} 个对齐裁剪后的视频`
+    : `已导出 ${completed} 个视频（原始画质）`;
+  showToast(msg, 'success');
+}
+
+exportModalConfirm.addEventListener('click', () => {
+  if (exportMode === 'individual') {
+    startIndividualExport();
+  } else {
+    startExportRecording();
+  }
+});
 
 let _comparePlaybackTimer = null;
 
@@ -3469,11 +4243,9 @@ function handleFiles(files) {
   }
   filePreview.style.display = 'flex';
 
-  // Auto-fill title from first file's name (if empty)
-  if (!videoTitle.value.trim()) {
-    const nameWithoutExt = videoFiles[0].name.replace(/\.[^.]+$/, '');
-    videoTitle.value = videoFiles.length === 1 ? nameWithoutExt : '';
-  }
+  // Auto-fill title from first file's name (always update on file selection)
+  const nameWithoutExt = videoFiles[0].name.replace(/\.[^.]+$/, '');
+  videoTitle.value = videoFiles.length === 1 ? nameWithoutExt : '';
 }
 
 function clearFile() {
@@ -3546,6 +4318,8 @@ videoForm.addEventListener('submit', async (e) => {
       fps: metadata.fps,
       useProxy: false,
       fileSize: file.size,
+      fileType: file.type || '',
+      originalName: file.name || '',
     };
 
     // Persist video blob to IndexedDB
@@ -3932,3 +4706,25 @@ init().catch(err => {
   console.error('[FilmArchive] 初始化失败:', err);
   showToast('数据加载失败，请刷新页面重试', 'error');
 });
+
+// ---- Auto-test: run alignment via URL parameter ----
+// Append ?test=GROUP_NAME to the URL to auto-run alignment after page load.
+// e.g. file:///.../index.html?test=夕阳拍摄
+(async function autoTestFromURL() {
+  const params = new URLSearchParams(window.location.search);
+  const testGroup = params.get('test') || params.get('autotest');
+  if (!testGroup) return;
+
+  console.log(`[AutoTest] URL 参数指定测试分组: "${testGroup}"`);
+  console.log('[AutoTest] 等待页面初始化完成 (2s) …');
+  await new Promise(r => setTimeout(r, 2000));
+
+  if (typeof debugAlignGroup !== 'function') {
+    console.error('[AutoTest] debugAlignGroup 函数不存在，请确认 script.js 已更新');
+    return;
+  }
+
+  console.log(`[AutoTest] 开始自动测试分组: "${testGroup}"`);
+  await debugAlignGroup(testGroup);
+  console.log('[AutoTest] ✅ 自动测试完成 — 请在浏览器中验证对齐效果');
+})();

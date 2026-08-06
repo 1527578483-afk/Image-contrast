@@ -272,58 +272,81 @@
   <!-- Export Video Modal -->
   <div class="modal-overlay" id="exportModalOverlay" style="display:none">
     <div class="modal modal--export" id="exportModal">
-      <h3 class="modal__title">导出合成视频</h3>
+      <h3 class="modal__title" id="exportModalTitle">导出视频</h3>
       <div class="modal__body">
-        <div class="form__row">
-          <div class="form__field form__field--half">
-            <label class="form__label">分辨率</label>
-            <select id="exportResolution" class="form__input form__select">
-              <option value="auto">全屏尺寸（自动）</option>
-              <option value="1080p">1080p (1920×1080)</option>
-              <option value="720p">720p (1280×720)</option>
-              <option value="4k">4K (3840×2160)</option>
-              <option value="custom">自定义</option>
-            </select>
-          </div>
-          <div class="form__field form__field--half">
-            <label class="form__label">帧速率</label>
-            <select id="exportFramerate" class="form__input form__select">
-              <option value="auto">自动检测</option>
-              <option value="24">24 fps</option>
-              <option value="30">30 fps</option>
-              <option value="60">60 fps</option>
-              <option value="custom">自定义</option>
-            </select>
-          </div>
-        </div>
-        <div class="form__row" id="exportCustomRow" style="display:none">
-          <div class="form__field form__field--half">
-            <label class="form__label">宽度 (px)</label>
-            <input id="exportCustomWidth" type="number" class="form__input" placeholder="1920" min="320" max="7680" />
-          </div>
-          <div class="form__field form__field--half">
-            <label class="form__label">高度 (px)</label>
-            <input id="exportCustomHeight" type="number" class="form__input" placeholder="1080" min="240" max="4320" />
-          </div>
-        </div>
-        <div class="form__row" id="exportFpsCustomRow" style="display:none">
-          <div class="form__field form__field--half">
-            <label class="form__label">自定义帧率</label>
-            <input id="exportCustomFps" type="number" class="form__input" placeholder="30" min="1" max="120" />
-          </div>
-        </div>
         <div class="form__field">
-          <label class="form__label">格式</label>
-          <select id="exportFormat" class="form__input form__select">
-            <option value="mp4">MP4 (H.264) — Safari</option>
-            <option value="webm">WebM (VP9) — Chrome / Firefox</option>
-          </select>
-          <span class="form__field-hint" id="exportFormatHint"></span>
+          <label class="form__label">导出模式</label>
+          <div class="mode-switch" id="exportModeSwitch">
+            <button type="button" class="mode-switch__btn mode-switch__btn--active" data-mode="composite">合成视频</button>
+            <button type="button" class="mode-switch__btn" data-mode="individual">单独导出</button>
+          </div>
+        </div>
+        <div id="exportCompositeOptions">
+          <div class="form__row">
+            <div class="form__field form__field--half">
+              <label class="form__label">分辨率</label>
+              <select id="exportResolution" class="form__input form__select">
+                <option value="auto">全屏尺寸（自动）</option>
+                <option value="1080p">1080p (1920×1080)</option>
+                <option value="720p">720p (1280×720)</option>
+                <option value="4k">4K (3840×2160)</option>
+                <option value="custom">自定义</option>
+              </select>
+            </div>
+            <div class="form__field form__field--half">
+              <label class="form__label">帧速率</label>
+              <select id="exportFramerate" class="form__input form__select">
+                <option value="auto">自动检测</option>
+                <option value="24">24 fps</option>
+                <option value="30">30 fps</option>
+                <option value="60">60 fps</option>
+                <option value="custom">自定义</option>
+              </select>
+            </div>
+          </div>
+          <div class="form__row" id="exportCustomRow" style="display:none">
+            <div class="form__field form__field--half">
+              <label class="form__label">宽度 (px)</label>
+              <input id="exportCustomWidth" type="number" class="form__input" placeholder="1920" min="320" max="7680" />
+            </div>
+            <div class="form__field form__field--half">
+              <label class="form__label">高度 (px)</label>
+              <input id="exportCustomHeight" type="number" class="form__input" placeholder="1080" min="240" max="4320" />
+            </div>
+          </div>
+          <div class="form__row" id="exportFpsCustomRow" style="display:none">
+            <div class="form__field form__field--half">
+              <label class="form__label">自定义帧率</label>
+              <input id="exportCustomFps" type="number" class="form__input" placeholder="30" min="1" max="120" />
+            </div>
+          </div>
+          <div class="form__field">
+            <label class="form__label">格式</label>
+            <select id="exportFormat" class="form__input form__select">
+              <option value="mp4">MP4 (H.264) — Safari</option>
+              <option value="webm">WebM (VP9) — Chrome / Firefox</option>
+            </select>
+            <span class="form__field-hint" id="exportFormatHint"></span>
+          </div>
+          <div class="form__field">
+            <label class="form__label">显示视频名称</label>
+            <label class="toggle">
+              <input type="checkbox" id="exportShowNames" class="toggle__input" checked />
+              <span class="toggle__track"></span>
+            </label>
+            <span class="form__field-hint">开启后每个视频的名称会显示在右下角</span>
+          </div>
+        </div>
+        <div id="exportIndividualInfo" style="display:none">
+          <p class="form__field-hint" style="margin:0;line-height:1.6;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-3px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+            每个视频将<span id="exportIndividualCount">单独导出</span>，<strong>保持原始分辨率、帧率、比特率和色彩</strong>，不做任何重新编码。
+          </p>
         </div>
       </div>
       <div class="modal__actions">
         <button type="button" class="btn modal__cancel" id="exportModalCancel">取消</button>
-        <button type="button" class="btn modal__confirm" id="exportModalConfirm">开始录制</button>
+        <button type="button" class="btn modal__confirm" id="exportModalConfirm">开始导出</button>
       </div>
     </div>
   </div>

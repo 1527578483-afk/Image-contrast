@@ -128,6 +128,31 @@ def _decode_pcm24(raw: bytes, nframes: int, nchannels: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# 预处理
+# ---------------------------------------------------------------------------
+
+def remove_dc(samples: np.ndarray) -> np.ndarray:
+    """去除 DC 偏移（减去均值），返回新数组。"""
+    mean = float(np.mean(samples))
+    if abs(mean) < 1e-8:
+        return samples
+    return samples - mean
+
+
+def compute_onset_envelope(energies: np.ndarray) -> np.ndarray:
+    """
+    从能量包络计算起音强度包络。
+    起音 = max(0, energy[i] - energy[i-1])，捕捉瞬态时间信息，
+    在不同设备的麦克风/编码差异下比原始能量更稳健。
+    """
+    onsets = np.zeros_like(energies)
+    if len(energies) > 1:
+        diff = np.diff(energies)
+        onsets[1:] = np.maximum(0, diff)
+    return onsets.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # 能量包络
 # ---------------------------------------------------------------------------
 
@@ -444,6 +469,9 @@ def perform_alignment(
 
         data.rms_db = compute_rms_db(data.samples)
 
+        # Remove DC offset — DC can skew RMS energy differently per device
+        data.samples = remove_dc(data.samples)
+
         # 粗糙包络（200ms 窗口）
         env_200 = compute_energy_envelope(data.samples, data.sample_rate, 200)
         peak_energy = float(np.max(env_200.energies)) if len(env_200.energies) > 0 else 0.0
@@ -523,6 +551,19 @@ def perform_alignment(
             offset2, score2 = correlate_envelopes_fft(ref_env, tgt_env, window_rate, max_drift_secs)
             if score2 > score:
                 offset, score = offset2, score2
+
+        # 如果仍然弱，尝试起音包络（瞬态信息跨设备更稳健）
+        if score < 0.25:
+            ref_onsets = compute_onset_envelope(ref_env.energies)
+            tgt_onsets = compute_onset_envelope(tgt_env.energies)
+            onset_ref_env = Envelope(energies=ref_onsets, window_rate=ref_env.window_rate)
+            onset_tgt_env = Envelope(energies=tgt_onsets, window_rate=tgt_env.window_rate)
+            onset_offset, onset_score = correlate_envelopes(onset_ref_env, onset_tgt_env, window_rate, max_drift_secs)
+            if onset_score > score:
+                offset, score = onset_offset, onset_score
+                if verbose:
+                    print(f"[AudioAlign]  槽位 {data.index}: 能量相关弱，改用起音包络 "
+                          f"(得分 {score:.3f})")
 
         corr_offsets[data.index] = offset
         corr_scores[data.index] = score
