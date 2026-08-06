@@ -708,6 +708,48 @@ body { min-height: 100vh; line-height: 1.6; }
 .compare__fullscreen-play.is-playing .play-icon { display: none; }
 .compare__fullscreen-play.is-playing .pause-icon { display: block; }
 
+/* Fullscreen progress bar (bottom, full-width) */
+.compare__fullscreen-progress {
+  position: fixed; bottom: 100px; left: 32px; right: 32px; z-index: 2001;
+  display: flex; flex-direction: column; gap: 4px;
+  opacity: 0.7;
+  transition: opacity 0.3s;
+}
+.compare__fullscreen-progress:hover { opacity: 1; }
+.compare__fullscreen-progress-track {
+  position: relative; width: 100%; height: 6px;
+  background: rgba(255,255,255,0.12);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: height 0.15s;
+}
+.compare__fullscreen-progress-track:hover { height: 10px; }
+.compare__fullscreen-progress-fill {
+  position: absolute; top: 0; left: 0; height: 100%;
+  background: var(--amber, #e2b04a);
+  border-radius: 3px;
+  transition: width 0.05s linear;
+  pointer-events: none;
+}
+.compare__fullscreen-progress-thumb {
+  position: absolute; top: 50%; transform: translate(-50%, -50%);
+  width: 14px; height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s, left 0.05s linear;
+}
+.compare__fullscreen-progress:hover .compare__fullscreen-progress-thumb,
+.compare__fullscreen-progress-track:hover .compare__fullscreen-progress-thumb { opacity: 1; }
+.compare__fullscreen-progress-time {
+  display: flex; justify-content: space-between;
+  font-family: var(--font-mono); font-size: 0.65rem;
+  color: rgba(255,255,255,0.5);
+}
+.compare__fullscreen-progress-current { color: rgba(255,255,255,0.8); }
+
 /* Fullscreen export button (floating, bottom-left) */
 .compare__fullscreen-export {
   position: fixed; bottom: 32px; left: 32px; z-index: 2002;

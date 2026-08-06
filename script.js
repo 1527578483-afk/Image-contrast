@@ -197,6 +197,26 @@ async function loadAllData() {
     }
   });
 
+  // Restore persisted compare state (alignment offsets + duration) for each group
+  groups.forEach(g => {
+    if (g.compareOffsets && Array.isArray(g.compareOffsets) && g.compareOffsets.some(o => o !== 0)) {
+      if (!state._compareByGroup[g.id]) {
+        state._compareByGroup[g.id] = {
+          slots: new Array(COMPARE_SLOTS).fill(null),
+          offsets: new Array(COMPARE_SLOTS).fill(0),
+          duration: null,
+        };
+      }
+      state._compareByGroup[g.id].offsets = g.compareOffsets;
+      if (g.compareDuration !== undefined && g.compareDuration !== null) {
+        state._compareByGroup[g.id].duration = g.compareDuration;
+      }
+    }
+    // Don't keep compare state duplicated on the group object
+    delete g.compareOffsets;
+    delete g.compareDuration;
+  });
+
   state.groups = groups;
   // Track color index to avoid duplicates
   if (groups.length > 0) {
@@ -210,7 +230,27 @@ async function persistGroup(group) {
   const db = await openDB();
   const tx = db.transaction('groups', 'readwrite');
   const store = tx.objectStore('groups');
-  store.put({ id: group.id, name: group.name, description: group.description, color: group.color, parentId: group.parentId || null });
+  // Read existing record first to preserve compare state (alignment offsets)
+  const existing = await new Promise((resolve) => {
+    const req = store.get(group.id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  });
+  const record = {
+    id: group.id,
+    name: group.name,
+    description: group.description,
+    color: group.color,
+    parentId: group.parentId || null,
+  };
+  // Preserve previously saved compare state when updating group metadata
+  if (existing) {
+    if (existing.compareOffsets) record.compareOffsets = existing.compareOffsets;
+    if (existing.compareDuration !== undefined && existing.compareDuration !== null) {
+      record.compareDuration = existing.compareDuration;
+    }
+  }
+  store.put(record);
   return new Promise((resolve, reject) => {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
@@ -1421,6 +1461,77 @@ function correlateEnvelopesRobust(refEnv, tgtEnv, windowRate, maxDriftSecs = 120
   return { ...energyResult, method: 'energy' };
 }
 
+// Minimum correlation score to consider a match reliable.
+// Below this threshold the videos likely do NOT share audio content
+// (different events, different locations, etc.) and any offset is spurious.
+const MIN_CORRELATION_SCORE = 0.18;
+
+/**
+ * Find the most distinctive ~6-second audio segment within the content region.
+ *
+ * Instead of cross-correlating the full audio (where quiet sections add noise),
+ * we locate the segment with the highest energy concentration AND the largest
+ * peak-to-valley dynamic range — the "signature" moment that is most likely to
+ * produce a clean cross-correlation match across devices.
+ *
+ * Scoring: mean_energy × std_dev_energy  (high loudness × high contrast)
+ *
+ * @returns {{ start: number, end: number, score: number }} in seconds
+ */
+function findBestWindow(env, contentStart, contentEnd, windowSecs = 6) {
+  const { energies, windowRate } = env;
+  const windowFrames = Math.floor(windowRate * windowSecs);
+  const startFrame = Math.floor(contentStart * windowRate);
+  const endFrame = Math.min(Math.floor(contentEnd * windowRate), energies.length);
+
+  // Content shorter than the target window — use the whole thing
+  if (endFrame - startFrame < windowFrames) {
+    let sum = 0, sumSq = 0;
+    for (let i = startFrame; i < endFrame; i++) {
+      sum += energies[i];
+      sumSq += energies[i] * energies[i];
+    }
+    const n = Math.max(1, endFrame - startFrame);
+    const mean = sum / n;
+    const variance = (sumSq / n) - (mean * mean);
+    const stdDev = variance > 0 ? Math.sqrt(variance) : 0;
+    return {
+      start: contentStart,
+      end: contentEnd,
+      score: mean * stdDev
+    };
+  }
+
+  let bestStart = startFrame;
+  let bestScore = -Infinity;
+  // Slide in 0.5 s steps for efficiency
+  const stepFrames = Math.max(1, Math.floor(windowRate * 0.5));
+
+  for (let i = startFrame; i + windowFrames <= endFrame; i += stepFrames) {
+    // Compute mean and std-dev in one pass
+    let sum = 0, sumSq = 0;
+    for (let j = i; j < i + windowFrames; j++) {
+      sum += energies[j];
+      sumSq += energies[j] * energies[j];
+    }
+    const mean = sum / windowFrames;
+    const variance = (sumSq / windowFrames) - (mean * mean);
+    const stdDev = variance > 0 ? Math.sqrt(variance) : 0;
+    const score = mean * stdDev; // high energy × high dynamic range
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = i;
+    }
+  }
+
+  return {
+    start: bestStart / windowRate,
+    end: (bestStart + windowFrames) / windowRate,
+    score: bestScore
+  };
+}
+
 /**
  * Extract a mono audio sample from a video blob URL.
  * Returns a Float32Array of PCM samples, or null if no audio track.
@@ -1497,19 +1608,14 @@ async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
     const duration = Math.min(video.duration || 30, sampleSecs);
     const captureSecs = Math.min(duration, 300); // cap at 5 min for memory safety
 
-    // --- Start playback ---
+    // --- Set up capture stream BEFORE playback ---
+    // CRITICAL: captureStream() + MediaRecorder MUST be set up before play()
+    // so the recorder captures audio from the very first frame. If play()
+    // starts first, the initial audio samples are lost and the recorded
+    // time coordinates diverge from the video's actual timeline — causing
+    // a systematic offset (~1 s on Android) vs primary-method extraction
+    // (which decodes the full audio track with accurate timestamps).
     video.currentTime = 0;
-    try {
-      await video.play();
-    } catch (playErr) {
-      console.warn('[AudioAlign] 视频元素回退：play() 被拒绝:', playErr.message);
-      return null;
-    }
-
-    // --- Capture audio via captureStream() + MediaRecorder ---
-    // This taps into the video's decoded audio output directly, bypassing
-    // the Web Audio graph entirely. More reliable than createMediaElementSource
-    // + ScriptProcessorNode, especially on file:// origins.
     const stream = video.captureStream();
     const audioTracks = stream.getAudioTracks();
 
@@ -1541,7 +1647,17 @@ async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
       recorder.onstop = resolve;
     });
 
+    // Start recorder BEFORE play() — captures every audio frame from t=0
     recorder.start();
+
+    // --- Start playback ---
+    try {
+      await video.play();
+    } catch (playErr) {
+      recorder.stop(); // clean up
+      console.warn('[AudioAlign] 视频元素回退：play() 被拒绝:', playErr.message);
+      return null;
+    }
 
     // Record for the target duration
     await new Promise(r => setTimeout(r, captureSecs * 1000));
@@ -1801,8 +1917,10 @@ async function performAudioAlignment() {
       return;
     }
 
-    // --- Phase 2: compute energy envelopes & detect content boundaries ---
+    // --- Phase 2: compute energy envelopes, detect content boundaries,
+    //            and find the most distinctive ~6 s segment per video ---
     const SILENT_THRESHOLD = 0.0005; // peak RMS < 0.0005 = essentially silent
+    const WINDOW_SECS = 6;          // duration of the "signature" segment
     let hasAudibleCount = 0;
 
     for (const data of valid) {
@@ -1828,7 +1946,10 @@ async function performAudioAlignment() {
         const bounds = detectContentBoundaries(fineEnv);
         data.contentStart = bounds.start;
         data.contentEnd = bounds.end;
-        console.log(`[AudioAlign] 槽位 ${data.slotIdx}: 内容 ${bounds.start.toFixed(2)}s→${bounds.end.toFixed(2)}s (总长${videoDur.toFixed(1)}s), 峰值能量=${(peakEnergy*1000).toFixed(1)}e-3, 包络点数=${data.env.energies.length}`);
+
+        // Find the most distinctive ~6 s segment within content boundaries
+        data.bestWin = findBestWindow(data.env, bounds.start, bounds.end, WINDOW_SECS);
+        console.log(`[AudioAlign] 槽位 ${data.slotIdx}: 内容 ${bounds.start.toFixed(2)}s→${bounds.end.toFixed(2)}s (总长${videoDur.toFixed(1)}s), 峰值能量=${(peakEnergy*1000).toFixed(1)}e-3, 最佳窗口 ${data.bestWin.start.toFixed(2)}s→${data.bestWin.end.toFixed(2)}s (得分=${(data.bestWin.score*1000).toFixed(1)}e-3)`);
       }
     }
 
@@ -1839,58 +1960,77 @@ async function performAudioAlignment() {
       return;
     }
 
-    // --- Phase 3: cross-correlate energy envelopes ---
-    // Strategy: pick the top-5 videos with highest peak energy as reference
-    // candidates. Use #1 as primary reference; correlate every other video
-    // against ALL top-5 candidates and pick the best-matching one.
+    // --- Phase 3: cross-correlate the best 6 s windows ---
+    // Instead of correlating the full audio envelope (where quiet sections
+    // add noise and produce spurious matches), we extract each video's most
+    // distinctive ~6 s segment — highest energy concentration × dynamic range —
+    // and cross-correlate only those "signature" windows.
     const audible = valid.filter(d => !d.isSilent);
     const corrOffsets = new Array(COMPARE_SLOTS).fill(0);
 
     if (audible.length >= 2) {
-      // Sort by peak energy descending → clearest audio first
-      const sortedByPeak = [...audible].sort((a, b) => b.peakEnergy - a.peakEnergy);
-      const top5 = sortedByPeak.slice(0, Math.min(5, sortedByPeak.length));
-      const primaryRef = top5[0]; // absolute highest peak
-
-      console.log(`[AudioAlign] 🔍 波峰最高的前 ${top5.length} 个视频作为参考基准：`);
-      top5.forEach((d, i) => {
-        console.log(`  ${i + 1}. 槽位${d.slotIdx} (video=${d.video?.title || '?'}) 峰值能量=${(d.peakEnergy * 1000).toFixed(1)}e-3`);
-      });
-
-      // Round 1: correlate each non-primary top-5 reference against the primary
-      for (let i = 1; i < top5.length; i++) {
-        const tgt = top5[i];
-        const avgRate = (primaryRef.env.windowRate + tgt.env.windowRate) / 2;
-        const result = correlateEnvelopesRobust(primaryRef.env, tgt.env, avgRate, 120);
-        corrOffsets[tgt.slotIdx] = result.offset;
-        console.log(`[AudioAlign] 参考#${i + 1}(槽位${tgt.slotIdx}) vs 主参考(槽位${primaryRef.slotIdx}): 偏移=${result.offset.toFixed(3)}s, 相关系数=${result.score.toFixed(3)} (${result.score > 0.3 ? '可信' : result.score > 0.1 ? '弱' : '不可靠'})`);
+      // --- Build window envelopes for each audible video ---
+      // Use a finer envelope (50 ms windows) for the 6 s segment to get
+      // better time resolution during cross-correlation.
+      for (const data of audible) {
+        const winStartSample = Math.floor(data.bestWin.start * data.sampleRate);
+        const winEndSample = Math.floor(data.bestWin.end * data.sampleRate);
+        const winSamples = data.samples.slice(winStartSample, winEndSample);
+        data.winEnv = computeEnergyEnvelope(winSamples, data.sampleRate, 50);
+        console.log(`[AudioAlign] 槽位 ${data.slotIdx} 窗口包络: ${data.winEnv.energies.length} 帧 @ ${data.winEnv.windowRate.toFixed(1)} Hz (${(winEndSample - winStartSample) / data.sampleRate}s)`);
       }
 
-      // Round 2: for each remaining video, try all top-5 refs → pick best
-      const remaining = audible.filter(d => !top5.includes(d));
-      for (const tgt of remaining) {
-        let bestScore = -Infinity;
-        let bestTotalOffset = 0;
-        let bestRefSlot = -1;
+      // --- Pick reference candidates by window score ---
+      // The video whose best window has the highest score (loudest + most
+      // dynamic) is the most reliable reference for correlation.
+      const sortedByWinScore = [...audible].sort((a, b) => b.bestWin.score - a.bestWin.score);
+      const top5 = sortedByWinScore.slice(0, Math.min(5, sortedByWinScore.length));
+      const primaryRef = top5[0];
 
-        for (const ref of top5) {
-          const avgRate = (ref.env.windowRate + tgt.env.windowRate) / 2;
-          const result = correlateEnvelopesRobust(ref.env, tgt.env, avgRate, 120);
-          // Chain: ref's own offset from primary + tgt's offset from ref
-          const totalOffset = (corrOffsets[ref.slotIdx] || 0) + result.offset;
+      console.log(`[AudioAlign] 🔍 最佳窗口得分最高的前 ${top5.length} 个视频作为参考基准：`);
+      top5.forEach((d, i) => {
+        console.log(`  ${i + 1}. 槽位${d.slotIdx} (video=${d.video?.title || '?'}) 窗口得分=${(d.bestWin.score*1000).toFixed(1)}e-3, 窗口位置=${d.bestWin.start.toFixed(2)}s→${d.bestWin.end.toFixed(2)}s`);
+      });
 
-          console.log(`[AudioAlign]   槽位${tgt.slotIdx} vs 参考槽位${ref.slotIdx}: 相对偏移=${result.offset.toFixed(3)}s, 总偏移=${totalOffset.toFixed(3)}s, 相关系数=${result.score.toFixed(3)}`);
+      // Correlate each non-primary video's window against the primary ref's window.
+      // maxDrift for a 6 s window is capped at 4 s — this guarantees at least 2 s
+      // of overlap and prevents the correlation from wandering into noise.
+      const WINDOW_MAX_DRIFT = 4;
 
-          if (result.score > bestScore) {
-            bestScore = result.score;
-            bestTotalOffset = totalOffset;
-            bestRefSlot = ref.slotIdx;
-          }
+      for (const tgt of audible) {
+        if (tgt === primaryRef) continue; // reference has zero offset
+
+        const avgRate = (primaryRef.winEnv.windowRate + tgt.winEnv.windowRate) / 2;
+        const result = correlateEnvelopesRobust(primaryRef.winEnv, tgt.winEnv, avgRate, WINDOW_MAX_DRIFT);
+
+        // winCorrOffset: positive = tgt's window content is behind primaryRef's window
+        const winCorrOffset = result.offset;
+
+        // Convert window alignment to full-video alignment:
+        // The same real-world moment maps to:
+        //   primaryRef at bestWin.start[primaryRef]
+        //   tgt         at bestWin.start[tgt] - winCorrOffset
+        // So tgt is shifted relative to primaryRef by:
+        //   (bestWin.start[tgt] - winCorrOffset) - bestWin.start[primaryRef]
+        const fullOffset = tgt.bestWin.start - primaryRef.bestWin.start - winCorrOffset;
+
+        if (result.score >= MIN_CORRELATION_SCORE) {
+          corrOffsets[tgt.slotIdx] = fullOffset;
+        } else {
+          corrOffsets[tgt.slotIdx] = 0;
+          tgt._unreliableCorr = true;
         }
 
-        corrOffsets[tgt.slotIdx] = bestTotalOffset;
-        const reliable = bestScore > 0.3 ? '✓可信' : bestScore > 0.1 ? '△弱匹配' : '✗不可靠';
-        console.log(`[AudioAlign] 槽位${tgt.slotIdx} → 最佳匹配: 参考槽位${bestRefSlot} (得分=${bestScore.toFixed(3)} ${reliable}), 最终偏移=${bestTotalOffset.toFixed(3)}s`);
+        const reliable = result.score >= MIN_CORRELATION_SCORE
+          ? (result.score > 0.3 ? '✓可信' : '△可接受')
+          : '✗不可靠（得分过低，视频可能不属同一事件）';
+        console.log(`[AudioAlign] 槽位${tgt.slotIdx} vs 主参考槽位${primaryRef.slotIdx}: 窗偏移=${winCorrOffset.toFixed(3)}s, 得分=${result.score.toFixed(3)} ${reliable}, 最终偏移=${corrOffsets[tgt.slotIdx].toFixed(3)}s (bestWin: ${tgt.bestWin.start.toFixed(2)}s vs ${primaryRef.bestWin.start.toFixed(2)}s)`);
+      }
+
+      // Count how many audible videos have unreliable correlation
+      const unreliableCount = audible.filter(d => d._unreliableCorr).length;
+      if (unreliableCount > 0) {
+        console.warn(`[AudioAlign] ⚠️ ${unreliableCount}/${audible.length - 1} 个非参考视频的相关性低于阈值 ${MIN_CORRELATION_SCORE}——这些视频的音频内容可能不相关（不同事件/地点）`);
       }
     } else {
       // Only one audible video — can't cross-correlate, just trim its silence
@@ -1966,23 +2106,46 @@ async function performAudioAlignment() {
     state.compareOffsets = offsets;
     state.compareDuration = commonDurationFinal;
 
+    // Persist alignment so it survives page reloads and is available
+    // when returning to this group's compare view later
+    persistCompareState(state.compareGroupId);
+
     // --- Show result ---
     const silentCount = valid.length - audible.length;
+    const unreliableCount = audible.filter(d => d._unreliableCorr).length;
+    const reliableAudible = audible.length - unreliableCount;
     const top5Count = Math.min(5, audible.length);
-    let msg = `对齐完成：以波峰最高的 ${top5Count} 个视频为基准`;
-    if (silentCount > 0) {
-      msg += `（${silentCount} 个视频无音频，跳过互相关）`;
+
+    let msg, toastType = 'success';
+    if (reliableAudible >= 2) {
+      msg = `对齐完成：以波峰最高的 ${top5Count} 个视频为基准`;
+      if (silentCount > 0) {
+        msg += `（${silentCount} 个视频无音频）`;
+      }
+      if (unreliableCount > 0) {
+        msg += `，${unreliableCount} 个视频音频不相关已跳过`;
+      }
+      msg += `，同步播放 ${commonDurationFinal.toFixed(1)}s`;
+    } else if (reliableAudible === 1) {
+      msg = `仅 1 个视频有可靠音频，无法互相关对齐——已根据内容边界裁剪静音`;
+      toastType = '';
+    } else {
+      msg = `所有视频音频均不相关——可能不属同一事件，各视频将从头同步播放`;
+      toastType = 'error';
     }
-    msg += `，同步播放 ${commonDurationFinal.toFixed(1)}s`;
-    showToast(msg, 'success');
+    showToast(msg, toastType);
 
     btnAlignAudio.classList.remove('is-processing');
-    btnAlignAudio.classList.add('is-aligned');
-    btnAlignAudio.innerHTML = `
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <polyline points="4,12 8,5 12,19 16,9 20,12"/>
-      </svg>
-      已对齐`;
+    if (reliableAudible >= 2 || (reliableAudible === 1 && silentCount === 0)) {
+      btnAlignAudio.classList.add('is-aligned');
+      btnAlignAudio.innerHTML = `
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="4,12 8,5 12,19 16,9 20,12"/>
+        </svg>
+        已对齐`;
+    } else {
+      syncAlignButton();
+    }
 
     // Re-render to show the new offsets
     renderCompareView();
@@ -1995,11 +2158,7 @@ async function performAudioAlignment() {
 
 function resetAlignButton() {
   btnAlignAudio.classList.remove('is-processing', 'is-aligned');
-  btnAlignAudio.innerHTML = `
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <polyline points="4,12 8,5 12,19 16,9 20,12"/>
-    </svg>
-    音频对齐`;
+  syncAlignButton();
 }
 
 /**
@@ -2008,12 +2167,40 @@ function resetAlignButton() {
 function clearAudioAlignment() {
   state.compareOffsets = new Array(COMPARE_SLOTS).fill(0);
   state.compareDuration = null;
-  btnAlignAudio.classList.remove('is-aligned');
-  btnAlignAudio.innerHTML = `
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <polyline points="4,12 8,5 12,19 16,9 20,12"/>
-    </svg>
-    音频对齐`;
+  // Also wipe persisted alignment so stale data doesn't reappear on reload
+  persistCompareState(state.compareGroupId);
+  syncAlignButton();
+}
+
+/**
+ * Persist the compare state (offsets + duration) for a group to IndexedDB
+ * so that alignment survives page reloads.
+ */
+async function persistCompareState(groupId) {
+  if (!groupId) return;
+  try {
+    const db = await openDB();
+    const tx = db.transaction('groups', 'readwrite');
+    const store = tx.objectStore('groups');
+    const req = store.get(groupId);
+    const record = await new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    if (!record) return;
+    const compareState = state._compareByGroup[groupId];
+    if (compareState) {
+      record.compareOffsets = [...compareState.offsets];
+      record.compareDuration = compareState.duration;
+    }
+    store.put(record);
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn('[FilmArchive] 保存对比状态失败:', err.message);
+  }
 }
 
 /**
@@ -2112,7 +2299,7 @@ btnAlignAudio.addEventListener('click', performAudioAlignment);
  * Render a video to a lower-resolution proxy using Canvas + MediaRecorder.
  * Returns a Blob of the rendered webm video (no audio — proxy is for visual only).
  */
-async function renderVideoToProxy(originalUrl, onProgress) {
+async function renderVideoToProxy(originalUrl, onProgress, rotation = 0) {
   const video = document.createElement('video');
   video.src = originalUrl;
   video.preload = 'auto';
@@ -2170,14 +2357,22 @@ async function renderVideoToProxy(originalUrl, onProgress) {
   const MAX_DIM = 1080;
   let w = video.videoWidth;
   let h = video.videoHeight;
-  if (Math.max(w, h) > MAX_DIM) {
-    const scale = MAX_DIM / Math.max(w, h);
+  // For 90/270 rotation, swap visual dimensions (canvas will be swapped too)
+  const isRotated90 = rotation === 90 || rotation === 270;
+  const visualW = isRotated90 ? h : w;
+  const visualH = isRotated90 ? w : h;
+  if (Math.max(visualW, visualH) > MAX_DIM) {
+    const scale = MAX_DIM / Math.max(visualW, visualH);
     w = Math.round(w * scale);
     h = Math.round(h * scale);
   }
   // Ensure even dimensions (some codecs require this)
   w = w % 2 === 0 ? w : w + 1;
   h = h % 2 === 0 ? h : h + 1;
+
+  // Canvas uses visual dimensions (swapped for 90/270 rotations)
+  const canvasW = isRotated90 ? h : w;
+  const canvasH = isRotated90 ? w : h;
 
   const canvas = document.createElement('canvas');
   canvas.width = w;
@@ -2196,7 +2391,7 @@ async function renderVideoToProxy(originalUrl, onProgress) {
 
   // Scale bitrate proportionally to resolution (base: 2Mbps for 720p-equivalent area)
   const REF_AREA = 1280 * 720;     // 921,600 px → 2 Mbps reference
-  const actualArea = w * h;
+  const actualArea = canvasW * canvasH;
   const scaledBitrate = Math.max(2000000, Math.round(2000000 * (actualArea / REF_AREA)));
 
   const chunks = [];
@@ -2226,7 +2421,18 @@ async function renderVideoToProxy(originalUrl, onProgress) {
       return;
     }
 
-    ctx.drawImage(video, 0, 0, w, h);
+    // Apply rotation if needed (match CSS rotation in compare view)
+    if (rotation !== 0) {
+      ctx.save();
+      ctx.translate(canvasW / 2, canvasH / 2);
+      if (rotation === 90) ctx.rotate(Math.PI / 2);
+      else if (rotation === 180) ctx.rotate(Math.PI);
+      else if (rotation === 270) ctx.rotate(-Math.PI / 2);
+      ctx.drawImage(video, -w / 2, -h / 2, w, h);
+      ctx.restore();
+    } else {
+      ctx.drawImage(video, 0, 0, w, h);
+    }
 
     // Progress callback
     if (onProgress && duration > 0) {
@@ -2310,7 +2516,7 @@ async function performRenderAll() {
       const renderedBlob = await renderVideoToProxy(item.video.url, (progress) => {
         const pct = Math.round(progress * 100);
         btnRenderAll.innerHTML = `<span class="compare__render-progress"></span>${completed + 1}/${total} — ${pct}%`;
-      });
+      }, item.video.rotation || 0);
 
       // Clean up old rendered URL before replacing
       if (item.video.renderedUrl) {
@@ -2351,9 +2557,34 @@ function renderCompareView() {
   renderCompareSlots();
   updateCompareMaster();
   updateRenderButtonState();
+  syncAlignButton(); // sync button state with current group's alignment
   // Set filled count for adaptive fullscreen grid
   const filled = state.compareSlots.filter(s => s !== null).length;
   compareSlotsEl.setAttribute('data-filled', filled);
+}
+
+/**
+ * Sync the audio-align button visual state with the CURRENT group's actual
+ * alignment data.  Without this the button leaks across groups — switching
+ * from an aligned group to an unaligned one still shows "已对齐".
+ */
+function syncAlignButton() {
+  const hasAligned = state.compareOffsets.some(o => o !== 0) && state.compareDuration !== null;
+  if (hasAligned) {
+    btnAlignAudio.classList.add('is-aligned');
+    btnAlignAudio.innerHTML = `
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="4,12 8,5 12,19 16,9 20,12"/>
+      </svg>
+      已对齐`;
+  } else {
+    btnAlignAudio.classList.remove('is-aligned');
+    btnAlignAudio.innerHTML = `
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="4,12 8,5 12,19 16,9 20,12"/>
+      </svg>
+      音频对齐`;
+  }
 }
 
 function renderCompareChips() {
@@ -2783,8 +3014,9 @@ function renderCompareSlots() {
       state.compareOffsets[fromIdx] = state.compareOffsets[i];
       state.compareOffsets[i] = tempOffset;
 
-      // Slot rearrangement invalidates audio alignment
-      clearAudioAlignment();
+      // Offsets travel with their videos — no need to re-align
+      // Save the swapped state so it survives page reload
+      persistCompareState(state.compareGroupId);
 
       pauseAllCompareSlots();
       state.compareIsPlaying = false;
@@ -2926,6 +3158,9 @@ compareMasterPlayBtn.addEventListener('click', () => {
 let fullscreenExitBtn = null;
 let fullscreenHint = null;
 let fullscreenPlayBtn = null;
+let fullscreenProgressBar = null;
+let fullscreenProgressRAF = null;
+let fullscreenDragSeek = false;
 
 function getGridAspectRatio(filled) {
   // Columns, rows → aspect ratio = (cols * 16) / (rows * 9)
@@ -2967,6 +3202,115 @@ function fitFullscreenGrid() {
       applyRotationTransform(video, inner, angle);
     }
   });
+}
+
+// ── Fullscreen progress bar helpers ──
+
+function formatProgressTime(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '0:00';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+/** Total duration shown on the progress bar (common timeline). */
+function getProgressDuration() {
+  const hasAlignment = state.compareDuration && state.compareDuration > 0
+    && state.compareOffsets.some(o => o !== 0);
+  if (hasAlignment) return state.compareDuration;
+  // Non-aligned: longest video duration
+  let maxDur = 0;
+  const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
+  slotEls.forEach(slotEl => {
+    const video = slotEl.querySelector('video');
+    if (video && video.duration > maxDur) maxDur = video.duration;
+  });
+  return maxDur || 0;
+}
+
+/** Current position on the common timeline (seconds). */
+function getProgressPosition() {
+  // Use the first filled slot's video to read the common-timeline position
+  const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
+  for (const slotEl of slotEls) {
+    const video = slotEl.querySelector('video');
+    if (video && video.currentTime > 0) {
+      const slotIdx = parseInt(slotEl.dataset.slot);
+      const offset = state.compareOffsets[slotIdx] || 0;
+      return Math.max(0, video.currentTime - offset);
+    }
+  }
+  return 0;
+}
+
+/** Seek all videos to a given position on the common timeline. */
+function seekAllToTimeline(targetSeconds) {
+  const hasAlignment = state.compareDuration && state.compareDuration > 0
+    && state.compareOffsets.some(o => o !== 0);
+
+  const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
+  slotEls.forEach(slotEl => {
+    const video = slotEl.querySelector('video');
+    if (!video) return;
+    const slotIdx = parseInt(slotEl.dataset.slot);
+    const offset = hasAlignment ? (state.compareOffsets[slotIdx] || 0) : 0;
+    const seekTarget = offset + targetSeconds;
+    if (seekTarget >= 0 && seekTarget < (video.duration || Infinity)) {
+      video.currentTime = seekTarget;
+    }
+  });
+}
+
+/** Update the progress bar fill, thumb, and time display. */
+function updateProgressBarUI(fraction, forceVisible) {
+  if (!fullscreenProgressBar) return;
+  const fill = fullscreenProgressBar.querySelector('.compare__fullscreen-progress-fill');
+  const thumb = fullscreenProgressBar.querySelector('.compare__fullscreen-progress-thumb');
+  const currentEl = fullscreenProgressBar.querySelector('.compare__fullscreen-progress-current');
+  const durationEl = fullscreenProgressBar.querySelector('.compare__fullscreen-progress-duration');
+
+  const pct = Math.max(0, Math.min(100, fraction * 100));
+  fill.style.width = pct + '%';
+  thumb.style.left = pct + '%';
+
+  const duration = getProgressDuration();
+  currentEl.textContent = formatProgressTime(fraction * duration);
+  durationEl.textContent = formatProgressTime(duration);
+
+  if (forceVisible) {
+    fullscreenProgressBar.classList.add('is-visible');
+    clearTimeout(fullscreenProgressBar._hideTimer);
+    fullscreenProgressBar._hideTimer = setTimeout(() => {
+      fullscreenProgressBar.classList.remove('is-visible');
+    }, 3000);
+  }
+}
+
+/** Start the RAF loop that keeps the progress bar in sync during playback. */
+function startProgressUpdates() {
+  if (fullscreenProgressRAF) return;
+  function tick() {
+    if (!viewCompare.classList.contains('compare--fullscreen')) {
+      fullscreenProgressRAF = null;
+      return;
+    }
+    if (!fullscreenDragSeek) {
+      const duration = getProgressDuration();
+      if (duration > 0) {
+        const pos = getProgressPosition();
+        updateProgressBarUI(Math.min(1, pos / duration));
+      }
+    }
+    fullscreenProgressRAF = requestAnimationFrame(tick);
+  }
+  fullscreenProgressRAF = requestAnimationFrame(tick);
+}
+
+function stopProgressUpdates() {
+  if (fullscreenProgressRAF) {
+    cancelAnimationFrame(fullscreenProgressRAF);
+    fullscreenProgressRAF = null;
+  }
 }
 
 function enterCompareFullscreen() {
@@ -3035,6 +3379,82 @@ function enterCompareFullscreen() {
   btnFullscreen.textContent = '退出全屏';
   document.body.style.overflow = 'hidden';
 
+  // --- Create progress bar ---
+  if (!fullscreenProgressBar) {
+    fullscreenProgressBar = document.createElement('div');
+    fullscreenProgressBar.className = 'compare__fullscreen-progress';
+    fullscreenProgressBar.innerHTML = `
+      <div class="compare__fullscreen-progress-track">
+        <div class="compare__fullscreen-progress-fill" style="width:0%"></div>
+        <div class="compare__fullscreen-progress-thumb" style="left:0%"></div>
+      </div>
+      <div class="compare__fullscreen-progress-time">
+        <span class="compare__fullscreen-progress-current">0:00</span>
+        <span class="compare__fullscreen-progress-duration">0:00</span>
+      </div>`;
+
+    const track = fullscreenProgressBar.querySelector('.compare__fullscreen-progress-track');
+
+    // Click on track → instant seek
+    track.addEventListener('click', (e) => {
+      const rect = track.getBoundingClientRect();
+      const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const targetTime = fraction * getProgressDuration();
+      seekAllToTimeline(targetTime);
+      updateProgressBarUI(fraction, true);
+    });
+
+    // Drag thumb → scrub
+    const thumb = fullscreenProgressBar.querySelector('.compare__fullscreen-progress-thumb');
+    const onDragStart = (e) => {
+      fullscreenDragSeek = true;
+      fullscreenProgressBar.classList.add('is-visible');
+      e.preventDefault();
+    };
+    const onDragMove = (clientX) => {
+      if (!fullscreenDragSeek) return;
+      const rect = track.getBoundingClientRect();
+      const fraction = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      updateProgressBarUI(fraction, true);
+    };
+    const onDragEnd = (clientX) => {
+      if (!fullscreenDragSeek) return;
+      fullscreenDragSeek = false;
+      const rect = track.getBoundingClientRect();
+      const fraction = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const targetTime = fraction * getProgressDuration();
+      seekAllToTimeline(targetTime);
+      updateProgressBarUI(fraction, true);
+    };
+
+    thumb.addEventListener('mousedown', onDragStart);
+    track.addEventListener('mousedown', (e) => {
+      // Only start drag if clicking on the track (not the fill)
+      fullscreenDragSeek = true;
+      fullscreenProgressBar.classList.add('is-visible');
+    });
+    document.addEventListener('mousemove', (e) => onDragMove(e.clientX));
+    document.addEventListener('mouseup', (e) => { onDragEnd(e.clientX); });
+    // Touch support
+    thumb.addEventListener('touchstart', onDragStart);
+    track.addEventListener('touchstart', (e) => {
+      fullscreenDragSeek = true;
+      fullscreenProgressBar.classList.add('is-visible');
+    });
+    document.addEventListener('touchmove', (e) => {
+      if (fullscreenDragSeek) onDragMove(e.touches[0].clientX);
+    }, { passive: false });
+    document.addEventListener('touchend', (e) => {
+      onDragEnd(e.changedTouches[0].clientX);
+    });
+
+    document.body.appendChild(fullscreenProgressBar);
+  }
+
+  // Show initial state
+  updateProgressBarUI(0, true);
+  startProgressUpdates();
+
   fitFullscreenGrid();
   window.addEventListener('resize', fitFullscreenGrid);
 }
@@ -3052,6 +3472,10 @@ function exitCompareFullscreen() {
 	fullscreenPlayBtn = null;
 	if (fullscreenExportBtn) fullscreenExportBtn.remove();
 	fullscreenExportBtn = null;
+  stopProgressUpdates();
+  if (fullscreenProgressBar) fullscreenProgressBar.remove();
+  fullscreenProgressBar = null;
+  fullscreenDragSeek = false;
   btnFullscreen.innerHTML = `
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <polyline points="15,3 21,3 21,9"/>
@@ -3287,19 +3711,24 @@ async function startExportRecording() {
 
   const videos = [];
   const videoTitles = []; // parallel array of video titles
+  const rotations = [];   // parallel array of rotation angles (0, 90, 180, 270)
+  const slotIndices = []; // parallel array: which slot (0-7) each video occupies
   const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
   slotEls.forEach(slotEl => {
     const video = slotEl.querySelector('video');
     if (video) {
       videos.push(video);
-      // Resolve title from compare slot video ID
+      // Resolve title and rotation from compare slot video ID
       const slotIdx = parseInt(slotEl.dataset.slot);
+      slotIndices.push(slotIdx);
       const videoId = state.compareSlots[slotIdx];
       if (videoId) {
         const result = findVideo(videoId);
         videoTitles.push(result ? result.video.title : '');
+        rotations.push(result ? (result.video.rotation || 0) : 0);
       } else {
         videoTitles.push('');
+        rotations.push(0);
       }
     }
   });
@@ -3351,16 +3780,34 @@ async function startExportRecording() {
       const row = Math.floor(i / layout.cols);
       const x = col * cellW;
       const y = row * cellH;
+      const rotation = rotations[i] || 0;
 
+      // Effective dimensions after rotation (90°/270° swap width & height visually)
       const vw = video.videoWidth || resolution.w;
       const vh = video.videoHeight || resolution.h;
-      const scale = Math.min(cellW / vw, cellH / vh);
+      const isRotated90 = rotation === 90 || rotation === 270;
+      const effW = isRotated90 ? vh : vw;
+      const effH = isRotated90 ? vw : vh;
+      const scale = Math.min(cellW / effW, cellH / effH);
       const dw = vw * scale;
       const dh = vh * scale;
       const dx = x + (cellW - dw) / 2;
       const dy = y + (cellH - dh) / 2;
+      const cx = x + cellW / 2;
+      const cy = y + cellH / 2;
 
-      ctx.drawImage(video, dx, dy, dw, dh);
+      // Apply rotation transform if needed (match the CSS rotation in compare view)
+      if (rotation !== 0) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        if (rotation === 90) ctx.rotate(Math.PI / 2);
+        else if (rotation === 180) ctx.rotate(Math.PI);
+        else if (rotation === 270) ctx.rotate(-Math.PI / 2);
+        ctx.drawImage(video, -dw / 2, -dh / 2, dw, dh);
+        ctx.restore();
+      } else {
+        ctx.drawImage(video, dx, dy, dw, dh);
+      }
 
       // Draw video name in bottom-right corner if enabled
       if (showNames && videoTitles[i]) {
@@ -3440,17 +3887,32 @@ async function startExportRecording() {
   const frameInterval = 1000 / fps;
   let lastFrameTime = 0;
 
-  // Find the longest video duration for progress tracking
+  // Find the longest effective duration for progress tracking
   const offsets = state.compareOffsets || [];
+  const hasAlignment = state.compareDuration && state.compareDuration > 0
+    && offsets.some(o => o !== 0);
   let maxEndTime = 0;
-  videos.forEach((v, i) => {
-    const dur = v.duration || 0;
-    const offset = offsets[i] || 0;
-    const endTime = Math.min(offset + dur, dur || Infinity);
-    if (endTime > maxEndTime) maxEndTime = endTime;
-  });
+  if (hasAlignment) {
+    // Aligned: all videos play from their offset for commonDuration
+    videos.forEach((v, i) => {
+      const offset = offsets[slotIndices[i]] || 0;
+      const dur = v.duration || 0;
+      const endTime = Math.min(offset + state.compareDuration, dur || Infinity);
+      if (endTime > maxEndTime) maxEndTime = endTime;
+    });
+  } else {
+    videos.forEach((v) => {
+      const dur = v.duration || 0;
+      if (dur > maxEndTime) maxEndTime = dur;
+    });
+  }
   // If we couldn't determine duration, fall back to a reasonable estimate
   if (!maxEndTime || !isFinite(maxEndTime)) maxEndTime = 30;
+
+  // Track real elapsed time for aligned export stop
+  // (will be set when playback actually starts after seek + play)
+  let playbackStartTime = 0;
+  const alignedStopTime = hasAlignment ? state.compareDuration * 1000 : null;
 
   // Determine whether all videos have ended
   function allEnded() {
@@ -3463,13 +3925,26 @@ async function startExportRecording() {
       drawFrame();
       lastFrameTime = timestamp;
     }
-    // Track progress: use the longest-duration video's currentTime
-    if (videos.length > 0 && maxEndTime > 0) {
-      const cur = Math.max(...videos.map(v => v.currentTime || 0));
-      updateExportProgress((cur / maxEndTime) * 100);
+    // Track progress
+    const elapsed = timestamp - playbackStartTime;
+    if (alignedStopTime && elapsed >= alignedStopTime) {
+      // Aligned export: stop after commonDuration
+      exportRecording = false;
+      if (exportRecorder && exportRecorder.state === 'recording') {
+        exportRecorder.stop();
+      }
+      updateExportProgress(100);
+      showExportDone();
+      return;
     }
-    // Auto-stop when all videos have finished
-    if (allEnded()) {
+    if (maxEndTime > 0) {
+      const pct = alignedStopTime
+        ? Math.min(100, (elapsed / alignedStopTime) * 100)
+        : (videos.length > 0 ? (Math.max(...videos.map(v => v.currentTime || 0)) / maxEndTime) * 100 : 0);
+      updateExportProgress(pct);
+    }
+    // Auto-stop when all videos have finished (non-aligned export fallback)
+    if (!alignedStopTime && allEnded()) {
       exportRecording = false;
       if (exportRecorder && exportRecorder.state === 'recording') {
         exportRecorder.stop();
@@ -3480,15 +3955,27 @@ async function startExportRecording() {
     animId = requestAnimationFrame(animLoop);
   }
 
-  // Seek all videos to start (apply alignment offsets if available)
-  videos.forEach((v, i) => {
-    const offset = offsets[i] || 0;
-    v.currentTime = Math.max(0, offset);
+  // Seek all videos to aligned start positions (use seeked event for precision)
+  await Promise.all(videos.map(async (v, i) => {
+    const offset = offsets[slotIndices[i]] || 0;
+    const targetTime = Math.max(0, offset);
+    if (targetTime > 0 && targetTime < (v.duration || Infinity)) {
+      await new Promise((resolve) => {
+        const onSeeked = () => {
+          v.removeEventListener('seeked', onSeeked);
+          resolve();
+        };
+        v.addEventListener('seeked', onSeeked);
+        v.currentTime = targetTime;
+        // Safety timeout in case seeked never fires
+        setTimeout(() => {
+          v.removeEventListener('seeked', onSeeked);
+          resolve();
+        }, 5000);
+      });
+    }
     v.muted = true;
-  });
-
-  // Wait briefly for seek, then start recording
-  await new Promise(r => setTimeout(r, 200));
+  }));
 
   exportRecording = true;
   recorder.start(100); // collect data every 100ms
@@ -3499,6 +3986,9 @@ async function startExportRecording() {
   } catch (e) {
     // autoplay might be blocked
   }
+
+  // Capture start time after playback has actually begun
+  playbackStartTime = performance.now();
 
   animId = requestAnimationFrame(animLoop);
 
@@ -3595,7 +4085,8 @@ function cleanupExport() {
 
 // --- Trim & encode a single video segment (used for aligned individual export) ---
 // Records [startSec, startSec+durationSec] at original resolution with high bitrate.
-async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title) {
+// rotation: 0, 90, 180, or 270 — applied to canvas drawing to match the rotated preview.
+async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title, rotation = 0) {
   const video = document.createElement('video');
   video.src = videoUrl;
   video.preload = 'auto';
@@ -3623,6 +4114,12 @@ async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title) {
   const hasVFC = 'requestVideoFrameCallback' in video;
   if (hasVFC) {
     video.currentTime = Math.max(0, startSec);
+    await new Promise((resolve) => {
+      const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+      video.addEventListener('seeked', onSeeked);
+      // Safety timeout
+      setTimeout(() => { video.removeEventListener('seeked', onSeeked); resolve(); }, 5000);
+    });
     await video.play();
     let frameCount = 0;
     const detectStart = performance.now();
@@ -3639,8 +4136,6 @@ async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title) {
       fps = Math.max(10, Math.min(60, Math.round(frameCount / elapsed)));
     }
     video.pause();
-    // If the stored metadata has fps, prefer it
-    // (we'll use our detected fps as fallback)
   }
 
   const canvas = document.createElement('canvas');
@@ -3672,9 +4167,13 @@ async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title) {
     if (e.data.size > 0) chunks.push(e.data);
   };
 
-  // Seek to start position
+  // Seek to start position (precise, using seeked event)
   video.currentTime = Math.max(0, startSec);
-  await new Promise(r => setTimeout(r, 300));
+  await new Promise((resolve) => {
+    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+    video.addEventListener('seeked', onSeeked);
+    setTimeout(() => { video.removeEventListener('seeked', onSeeked); resolve(); }, 5000);
+  });
 
   recorder.start(100);
   await video.play();
@@ -3682,6 +4181,13 @@ async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title) {
   // Draw loop — stop after durationSec
   const startTime = performance.now();
   const targetMs = durationSec * 1000;
+
+  // For rotated videos, swap canvas dimensions to match visual output
+  const hasSwapRotation = rotation === 90 || rotation === 270;
+  if (hasSwapRotation && canvas.width > 0 && canvas.height > 0) {
+    canvas.width = h;
+    canvas.height = w;
+  }
 
   await new Promise((resolve) => {
     const drawLoop = () => {
@@ -3691,7 +4197,18 @@ async function trimAndDownloadVideo(videoUrl, startSec, durationSec, title) {
         return;
       }
       if (video.readyState >= 2) {
-        ctx.drawImage(video, 0, 0, w, h);
+        if (rotation !== 0) {
+          ctx.save();
+          ctx.translate(canvas.width / 2, canvas.height / 2);
+          if (rotation === 90) ctx.rotate(Math.PI / 2);
+          else if (rotation === 180) ctx.rotate(Math.PI);
+          else if (rotation === 270) ctx.rotate(-Math.PI / 2);
+          // For 90/270, canvas was already swapped, so w/h are visually correct
+          ctx.drawImage(video, -w / 2, -h / 2, w, h);
+          ctx.restore();
+        } else {
+          ctx.drawImage(video, 0, 0, w, h);
+        }
       }
       requestAnimationFrame(drawLoop);
     };
@@ -3775,7 +4292,7 @@ async function startIndividualExport() {
           label.appendChild(document.createTextNode(` 正在导出 (${completed + 1}/${total}): ${video.title}`));
         }
       }
-      await trimAndDownloadVideo(video.url, offset, commonDuration, video.title);
+      await trimAndDownloadVideo(video.url, offset, commonDuration, video.title, video.rotation || 0);
     } else {
       // No alignment — download original blob as-is, preserving original format
       if (exportProgressEl) {

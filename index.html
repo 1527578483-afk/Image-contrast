@@ -91,11 +91,11 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           添加视频
         </button>
-        <form id="videoForm" class="form form--collapsed">
+        <form id="videoForm" class="form form--collapsed" novalidate>
           <div class="form__row">
             <div class="form__field form__field--half">
               <label for="videoTitle" class="form__label">标题</label>
-              <input id="videoTitle" type="text" class="form__input" placeholder="视频名称" required />
+              <input id="videoTitle" type="text" class="form__input" placeholder="视频名称（选填）" />
             </div>
             <div class="form__field form__field--half">
               <label for="videoDescription" class="form__label">备注</label>
@@ -140,7 +140,7 @@
             <polygon points="10,8 10,16 16,12" fill="currentColor" opacity="0.3"/>
           </svg>
         </div></div>
-        <h3 class="empty__title">此分组暂无影片</h3>
+        <h3 class="empty__title">此组暂无视频</h3>
         <p class="empty__desc">添加视频到此分组</p>
       </div>
 
