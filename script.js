@@ -1966,10 +1966,6 @@ async function performAudioAlignment() {
 
   btnAlignAudio.classList.add('is-processing');
   btnAlignAudio.textContent = '分析中…';
-  if (btnTimelineAutoAlign) {
-    btnTimelineAutoAlign.classList.add('is-processing');
-    btnTimelineAutoAlign.textContent = '分析中…';
-  }
   showToast('正在提取音频、检测内容边界并对齐…');
 
   try {
@@ -2260,7 +2256,6 @@ async function performAudioAlignment() {
     showToast(msg, toastType);
 
     btnAlignAudio.classList.remove('is-processing');
-    if (btnTimelineAutoAlign) btnTimelineAutoAlign.classList.remove('is-processing');
     if (reliableAudible >= 2 || (reliableAudible === 1 && silentCount === 0)) {
       btnAlignAudio.classList.add('is-aligned');
       btnAlignAudio.innerHTML = `
@@ -2268,10 +2263,6 @@ async function performAudioAlignment() {
           <polyline points="4,12 8,5 12,19 16,9 20,12"/>
         </svg>
         已对齐`;
-      if (btnTimelineAutoAlign) {
-        btnTimelineAutoAlign.classList.add('is-aligned');
-        btnTimelineAutoAlign.textContent = '✓ 已对齐';
-      }
     } else {
       syncAlignButton();
     }
@@ -2290,10 +2281,6 @@ async function performAudioAlignment() {
 
 function resetAlignButton() {
   btnAlignAudio.classList.remove('is-processing', 'is-aligned');
-  if (btnTimelineAutoAlign) {
-    btnTimelineAutoAlign.classList.remove('is-processing', 'is-aligned');
-    btnTimelineAutoAlign.textContent = '🎵 自动对齐';
-  }
   syncAlignButton();
 }
 
@@ -3363,6 +3350,21 @@ const timelineView = {
 };
 
 /**
+ * Reset the global timeline view state so stale data from a previous group
+ * never leaks into a different group's timeline rendering.
+ */
+function resetTimelineView() {
+  timelineView.totalDuration = 0;
+  timelineView.commonEnd = 0;
+  timelineView.draggingSlot = null;
+  timelineView.dragStartX = 0;
+  timelineView.dragStartOffset = 0;
+  timelineView.dragRangeHandle = null;
+  // Reset scroll position
+  if (timelineScroll) timelineScroll.scrollLeft = 0;
+}
+
+/**
  * Get the stored audio data for a slot, or null.
  */
 function getAudioDataForSlot(slotIdx) {
@@ -3382,6 +3384,9 @@ function renderTimelinePanel() {
     return;
   }
   timelinePanel.style.display = '';
+
+  // Reset any lingering global state from a previous group
+  resetTimelineView();
 
   const gid = state.compareGroupId;
   const groupStore = gid ? state._compareByGroup[gid] : null;
@@ -3484,7 +3489,7 @@ function renderTimelinePanel() {
       if (canvas) drawWaveformOnCanvas(canvas, s);
     }
     drawRuler(commonEnd);
-    drawRangeBar();
+    drawRangeBar(gid, commonEnd);
   });
 }
 
@@ -3650,20 +3655,23 @@ function drawRuler(totalDuration) {
 
 /**
  * Draw the range selection bar.
+ * Accepts optional gid and fullDur to avoid reading stale global state
+ * when called from requestAnimationFrame after a group switch.
  */
-function drawRangeBar() {
+function drawRangeBar(gid, fullDur) {
   const bar = timelineRangeBar;
   const sel = timelineRangeSelection;
   const maskLeft = $('#timelineRangeMaskLeft');
   const maskRight = $('#timelineRangeMaskRight');
   if (!bar || !sel) return;
 
-  const gid = state.compareGroupId;
+  if (gid === undefined) gid = state.compareGroupId;
+  if (fullDur === undefined) fullDur = timelineView.commonEnd || timelineView.totalDuration;
+
   const groupStore = gid ? state._compareByGroup[gid] : null;
   const commonStart = groupStore ? (groupStore.commonStart || 0) : 0;
-  const commonDur = state.compareDuration || timelineView.commonEnd;
+  const commonDur = gid ? (_ensureCompareGroup(gid).duration || fullDur) : fullDur;
 
-  const fullDur = timelineView.commonEnd || timelineView.totalDuration;
   if (fullDur <= 0) return;
 
   const startPct = (commonStart / fullDur) * 100;
@@ -4092,12 +4100,6 @@ btnFullscreen.addEventListener('click', () => {
 
 // --- Timeline Panel Event Handlers ---
 
-// Auto-align button inside timeline panel header
-const btnTimelineAutoAlign = $('#btnTimelineAutoAlign');
-if (btnTimelineAutoAlign) {
-  btnTimelineAutoAlign.addEventListener('click', performAudioAlignment);
-}
-
 // Toggle timeline panel visibility
 btnTimelineToggle.addEventListener('click', () => {
   state.timelineVisible = !state.timelineVisible;
@@ -4262,7 +4264,7 @@ document.addEventListener('pointermove', (e) => {
     groupStore.commonStart = Math.round(commonStart * 100) / 100;
   }
 
-  drawRangeBar();
+  drawRangeBar(gid, fullDur);
 });
 
 document.addEventListener('pointerup', () => {
@@ -4271,6 +4273,10 @@ document.addEventListener('pointerup', () => {
     timelineView.dragRangeHandle = null;
     // Apply to offsets: add commonStart as uniform shift
     applyRangeToOffsets();
+    // Re-draw range bar with current group to ensure correct state
+    const currGid = state.compareGroupId;
+    const currFullDur = timelineView.commonEnd || timelineView.totalDuration;
+    drawRangeBar(currGid, currFullDur);
   }
 });
 
@@ -4281,7 +4287,9 @@ document.addEventListener('pointerup', () => {
 function applyRangeToOffsets() {
   // The range start is a global shift; we handle this during playback by
   // reading commonStart alongside compareOffsets. No need to mutate offsets.
-  drawRangeBar();
+  const gid = state.compareGroupId;
+  const fullDur = timelineView.commonEnd || timelineView.totalDuration;
+  drawRangeBar(gid, fullDur);
 }
 
 // Sync scroll between ruler canvas and tracks
