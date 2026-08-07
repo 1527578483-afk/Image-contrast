@@ -133,7 +133,7 @@ function openDB() {
 
 async function loadAllData() {
   const db = await openDB();
-  console.log('[ShotSync] IndexedDB 已打开');
+  console.log('[视频档案] IndexedDB 已打开');
 
   // Load groups
   const groups = await new Promise((resolve, reject) => {
@@ -144,7 +144,7 @@ async function loadAllData() {
     req.onerror = () => reject(req.error);
   });
 
-  console.log('[ShotSync] 从DB读取到', groups.length, '个分组');
+  console.log('[视频档案] 从DB读取到', groups.length, '个分组');
 
   // Load videos
   const videos = await new Promise((resolve, reject) => {
@@ -155,7 +155,7 @@ async function loadAllData() {
     req.onerror = () => reject(req.error);
   });
 
-  console.log('[ShotSync] 从DB读取到', videos.length, '个视频');
+  console.log('[视频档案] 从DB读取到', videos.length, '个视频');
 
   // Assemble: attach videos to their groups, create blob URLs
   const videoMap = {};
@@ -2325,7 +2325,7 @@ async function persistCompareState(groupId) {
       tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
-    console.warn('[ShotSync] 保存对比状态失败:', err.message);
+    console.warn('[视频档案] 保存对比状态失败:', err.message);
   }
 }
 
@@ -5835,7 +5835,7 @@ async function backfillVideoMetadata() {
   }
 
   if (needsBackfill.length === 0) return;
-  console.log(`[ShotSync] Backfilling metadata for ${needsBackfill.length} videos...`);
+  console.log(`[视频档案] Backfilling metadata for ${needsBackfill.length} videos...`);
 
   for (const video of needsBackfill) {
     if (!video.url) continue;
@@ -5892,7 +5892,7 @@ async function backfillVideoMetadata() {
         fps: video.fps,
       });
     } catch {
-      console.warn(`[ShotSync] Could not extract metadata for: ${video.title}`);
+      console.warn(`[视频档案] Could not extract metadata for: ${video.title}`);
     } finally {
       tmp.removeAttribute('src');
       tmp.load();
@@ -5900,7 +5900,7 @@ async function backfillVideoMetadata() {
     }
   }
 
-  console.log('[ShotSync] Metadata backfill complete — refreshing view');
+  console.log('[视频档案] Metadata backfill complete — refreshing view');
   refreshCurrentView();
 }
 
@@ -6082,16 +6082,16 @@ if (groupDetailDesc) {
 // Initialize (with persistence)
 // ============================================
 async function init() {
-  console.log('[ShotSync] 正在加载数据...');
-  console.log('[ShotSync] DB名称:', DB_NAME, '版本:', DB_VERSION);
+  console.log('[视频档案] 正在加载数据...');
+  console.log('[视频档案] DB名称:', DB_NAME, '版本:', DB_VERSION);
   await loadAllData();
 
-  console.log('[ShotSync] 加载完成:', state.groups.length, '个分组,',
+  console.log('[视频档案] 加载完成:', state.groups.length, '个分组,',
     state.groups.reduce((s, g) => s + g.videos.length, 0), '个视频');
 
   // Create default group if empty
   if (state.groups.length === 0) {
-    console.log('[ShotSync] 数据为空，创建默认分组');
+    console.log('[视频档案] 数据为空，创建默认分组');
     const defaultGroup = {
       id: generateId(),
       name: '默认分组',
@@ -6109,12 +6109,12 @@ async function init() {
 
   // Backfill metadata for existing videos in the background (runs after UI renders)
   backfillVideoMetadata().catch(err => {
-    console.warn('[ShotSync] Metadata backfill error:', err);
+    console.warn('[视频档案] Metadata backfill error:', err);
   });
 }
 
 init().catch(err => {
-  console.error('[ShotSync] 初始化失败:', err);
+  console.error('[视频档案] 初始化失败:', err);
   showToast('数据加载失败，请刷新页面重试', 'error');
 });
 
