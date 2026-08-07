@@ -200,9 +200,10 @@ async function loadAllData() {
     }
   });
 
-  // Restore persisted compare state (alignment offsets + duration + audio data) for each group
+  // Restore persisted compare state (slots + alignment offsets + duration + audio data) for each group
   groups.forEach(g => {
-    const hasState = (g.compareOffsets && Array.isArray(g.compareOffsets) && g.compareOffsets.some(o => o !== 0))
+    const hasState = (g.compareSlots && Array.isArray(g.compareSlots) && g.compareSlots.some(s => s !== null))
+      || (g.compareOffsets && Array.isArray(g.compareOffsets) && g.compareOffsets.some(o => o !== 0))
       || (g.audioData && g.audioData.some(d => d !== null))
       || (g.commonStart)
       || (g.compareDuration !== undefined && g.compareDuration !== null);
@@ -216,6 +217,7 @@ async function loadAllData() {
           audioData: new Array(COMPARE_SLOTS).fill(null),
         };
       }
+      if (g.compareSlots) state._compareByGroup[g.id].slots = g.compareSlots;
       if (g.compareOffsets) state._compareByGroup[g.id].offsets = g.compareOffsets;
       if (g.compareDuration !== undefined && g.compareDuration !== null) {
         state._compareByGroup[g.id].duration = g.compareDuration;
@@ -232,6 +234,7 @@ async function loadAllData() {
       }
     }
     // Don't keep compare state duplicated on the group object
+    delete g.compareSlots;
     delete g.compareOffsets;
     delete g.compareDuration;
     delete g.commonStart;
@@ -266,6 +269,7 @@ async function persistGroup(group) {
   };
   // Preserve previously saved compare state when updating group metadata
   if (existing) {
+    if (existing.compareSlots) record.compareSlots = existing.compareSlots;
     if (existing.compareOffsets) record.compareOffsets = existing.compareOffsets;
     if (existing.compareDuration !== undefined && existing.compareDuration !== null) {
       record.compareDuration = existing.compareDuration;
@@ -743,6 +747,19 @@ function navigate(view, groupId) {
   state.activeGroupId = groupId || null;
   state.groupPage = 0;
   state.groupIsPlaying = false;
+
+  // Persist current view so refresh returns to the same page
+  localStorage.setItem('activeView', view);
+  if (groupId) {
+    localStorage.setItem('activeGroupId', groupId);
+  } else {
+    localStorage.removeItem('activeGroupId');
+  }
+  if (view === 'compare') {
+    localStorage.setItem('compareGroupId', state.compareGroupId || '');
+  } else {
+    localStorage.removeItem('compareGroupId');
+  }
 
   viewGroups.style.display = view === 'groups' ? 'block' : 'none';
   viewGroup.style.display = view === 'group' ? 'block' : 'none';
@@ -2302,6 +2319,7 @@ async function persistCompareState(groupId) {
     if (!record) return;
     const compareState = state._compareByGroup[groupId];
     if (compareState) {
+      record.compareSlots = [...compareState.slots]; // persist which videos are in which slots
       record.compareOffsets = [...compareState.offsets];
       record.compareDuration = compareState.duration;
       record.commonStart = compareState.commonStart || 0;
@@ -6104,7 +6122,21 @@ async function init() {
     await persistGroup(defaultGroup);
   }
 
-  navigate('groups');
+  // Restore the last active view from localStorage so refresh keeps the same page
+  const savedView = localStorage.getItem('activeView');
+  const savedGroupId = localStorage.getItem('activeGroupId');
+  const savedCompareGroupId = localStorage.getItem('compareGroupId');
+
+  if (savedView === 'compare' && savedCompareGroupId && findGroup(savedCompareGroupId)) {
+    state.compareGroupId = savedCompareGroupId;
+    navigate('compare', savedCompareGroupId);
+  } else if (savedView === 'group' && savedGroupId && findGroup(savedGroupId)) {
+    navigate('group', savedGroupId);
+  } else if (savedView === 'groups') {
+    navigate('groups');
+  } else {
+    navigate('groups');
+  }
   videoTitle.focus();
 
   // Backfill metadata for existing videos in the background (runs after UI renders)
