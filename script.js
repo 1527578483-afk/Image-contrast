@@ -1966,6 +1966,10 @@ async function performAudioAlignment() {
 
   btnAlignAudio.classList.add('is-processing');
   btnAlignAudio.textContent = '分析中…';
+  if (btnTimelineAutoAlign) {
+    btnTimelineAutoAlign.classList.add('is-processing');
+    btnTimelineAutoAlign.textContent = '分析中…';
+  }
   showToast('正在提取音频、检测内容边界并对齐…');
 
   try {
@@ -2256,6 +2260,7 @@ async function performAudioAlignment() {
     showToast(msg, toastType);
 
     btnAlignAudio.classList.remove('is-processing');
+    if (btnTimelineAutoAlign) btnTimelineAutoAlign.classList.remove('is-processing');
     if (reliableAudible >= 2 || (reliableAudible === 1 && silentCount === 0)) {
       btnAlignAudio.classList.add('is-aligned');
       btnAlignAudio.innerHTML = `
@@ -2263,6 +2268,10 @@ async function performAudioAlignment() {
           <polyline points="4,12 8,5 12,19 16,9 20,12"/>
         </svg>
         已对齐`;
+      if (btnTimelineAutoAlign) {
+        btnTimelineAutoAlign.classList.add('is-aligned');
+        btnTimelineAutoAlign.textContent = '✓ 已对齐';
+      }
     } else {
       syncAlignButton();
     }
@@ -2281,6 +2290,10 @@ async function performAudioAlignment() {
 
 function resetAlignButton() {
   btnAlignAudio.classList.remove('is-processing', 'is-aligned');
+  if (btnTimelineAutoAlign) {
+    btnTimelineAutoAlign.classList.remove('is-processing', 'is-aligned');
+    btnTimelineAutoAlign.textContent = '🎵 自动对齐';
+  }
   syncAlignButton();
 }
 
@@ -3389,7 +3402,7 @@ function renderTimelinePanel() {
 
   if (filledSlots.length < 1) {
     timelineTracks.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:0.7rem;">请先添加视频到对比槽位</div>';
-    // Clear range bar and ruler so stale data from previous group doesn't show
+    // Clear range bar, masks, and ruler so stale data from previous group doesn't show
     if (timelineRangeBar) {
       timelineRangeBar.style.width = '0px';
     }
@@ -3397,6 +3410,10 @@ function renderTimelinePanel() {
       timelineRangeSelection.style.left = '0%';
       timelineRangeSelection.style.width = '0%';
     }
+    const maskL = $('#timelineRangeMaskLeft');
+    const maskR = $('#timelineRangeMaskRight');
+    if (maskL) maskL.style.width = '0%';
+    if (maskR) maskR.style.width = '0%';
     if (timelineRuler) {
       const ctx = timelineRuler.getContext('2d');
       ctx.clearRect(0, 0, timelineRuler.width, timelineRuler.height);
@@ -3515,17 +3532,40 @@ function drawWaveformOnCanvas(canvas, slotInfo) {
 
   const windowPx = (1 / envWindowRate) * pxPerSec;
 
-  // Draw waveform bars in amber on top of the gray background
-  ctx.fillStyle = 'rgba(226, 176, 74, 0.5)';
+  // --- Pass 1: draw all waveform bars in dim amber (full duration) ---
+  ctx.fillStyle = 'rgba(226, 176, 74, 0.25)';
   for (let j = 0; j < energyEnvelope.length; j++) {
     const t = j / envWindowRate;
     const x = t * pxPerSec;
     if (x > w + windowPx) break;
-
     const normEnergy = energyEnvelope[j] / maxEnergy;
     const barH = Math.max(1, normEnergy * (h * 0.8));
     const y = h - barH;
     ctx.fillRect(x, y, Math.max(1, windowPx - 0.5), barH);
+  }
+
+  // --- Pass 2: overlay content region (contentStart→contentEnd) brighter ---
+  const cs = (audio.contentStart || 0);
+  const ce = (audio.contentEnd || audio.duration || 0);
+  if (ce > cs) {
+    const csX = cs * pxPerSec;
+    const ceX = ce * pxPerSec;
+    ctx.fillStyle = 'rgba(226, 176, 74, 0.65)';
+    for (let j = 0; j < energyEnvelope.length; j++) {
+      const t = j / envWindowRate;
+      const x = t * pxPerSec;
+      if (x > ceX + windowPx) break;
+      if (x + windowPx < csX) continue; // skip bars entirely before contentStart
+      const normEnergy = energyEnvelope[j] / maxEnergy;
+      const barH = Math.max(1, normEnergy * (h * 0.8));
+      const y = h - barH;
+      // Clip the bar to only draw within content region
+      const bx = Math.max(csX, x);
+      const bw = Math.min(ceX, x + windowPx - 0.5) - bx;
+      if (bw > 0) {
+        ctx.fillRect(bx, y, Math.max(1, bw), barH);
+      }
+    }
   }
 
   // Subtle marker at the video's own time=0 (left edge of the bar)
@@ -3535,6 +3575,22 @@ function drawWaveformOnCanvas(canvas, slotInfo) {
   ctx.moveTo(0, 0);
   ctx.lineTo(0, h);
   ctx.stroke();
+
+  // Content boundary markers
+  if (ce > cs) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath();
+    ctx.moveTo(cs * pxPerSec, 0);
+    ctx.lineTo(cs * pxPerSec, h);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(ce * pxPerSec, 0);
+    ctx.lineTo(ce * pxPerSec, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
 }
 
 /**
@@ -3598,6 +3654,8 @@ function drawRuler(totalDuration) {
 function drawRangeBar() {
   const bar = timelineRangeBar;
   const sel = timelineRangeSelection;
+  const maskLeft = $('#timelineRangeMaskLeft');
+  const maskRight = $('#timelineRangeMaskRight');
   if (!bar || !sel) return;
 
   const gid = state.compareGroupId;
@@ -3613,6 +3671,16 @@ function drawRangeBar() {
 
   sel.style.left = startPct + '%';
   sel.style.width = Math.max(0, endPct - startPct) + '%';
+
+  // Dimming masks outside the selected range
+  if (maskLeft) {
+    maskLeft.style.width = startPct + '%';
+    maskLeft.style.display = startPct > 0 ? '' : 'none';
+  }
+  if (maskRight) {
+    maskRight.style.width = Math.max(0, 100 - endPct) + '%';
+    maskRight.style.display = endPct < 100 ? '' : 'none';
+  }
 }
 
 /**
@@ -4023,6 +4091,12 @@ btnFullscreen.addEventListener('click', () => {
 });
 
 // --- Timeline Panel Event Handlers ---
+
+// Auto-align button inside timeline panel header
+const btnTimelineAutoAlign = $('#btnTimelineAutoAlign');
+if (btnTimelineAutoAlign) {
+  btnTimelineAutoAlign.addEventListener('click', performAudioAlignment);
+}
 
 // Toggle timeline panel visibility
 btnTimelineToggle.addEventListener('click', () => {

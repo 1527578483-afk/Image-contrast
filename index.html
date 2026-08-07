@@ -237,6 +237,7 @@
       <div class="timeline-panel" id="timelinePanel" style="display:none">
         <div class="timeline-panel__header">
           <span class="timeline-panel__label">手动对齐时间轴</span>
+          <button type="button" class="btn btn--sm timeline-panel__auto-align" id="btnTimelineAutoAlign" title="对当前分组视频自动音频对齐">🎵 自动对齐</button>
           <div class="timeline-panel__zoom">
             <button type="button" class="timeline-panel__zoom-btn" data-action="zoom-out" title="缩小">−</button>
             <span class="timeline-panel__zoom-label" id="timelineZoomLabel">适配</span>
@@ -246,7 +247,9 @@
         </div>
         <div class="timeline-panel__scroll" id="timelineScroll">
           <div class="timeline-panel__range-bar" id="timelineRangeBar">
+            <div class="timeline-panel__range-mask timeline-panel__range-mask--left" id="timelineRangeMaskLeft"></div>
             <div class="timeline-panel__range-selection" id="timelineRangeSelection"></div>
+            <div class="timeline-panel__range-mask timeline-panel__range-mask--right" id="timelineRangeMaskRight"></div>
           </div>
           <canvas class="timeline-panel__ruler" id="timelineRuler"></canvas>
           <div class="timeline-panel__tracks" id="timelineTracks">
