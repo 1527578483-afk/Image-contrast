@@ -24,6 +24,7 @@ const state = {
   compareSourceGroupId: null,
   // Per-group compare slot storage — exposed via getter/setter below
   _compareByGroup: {},
+  timelineVisible: false,
 };
 
 // compareSlots and compareOffsets are proxied to per-group storage
@@ -34,6 +35,8 @@ function _ensureCompareGroup(gid) {
       slots: new Array(COMPARE_SLOTS).fill(null),
       offsets: new Array(COMPARE_SLOTS).fill(0),
       duration: null,
+      commonStart: 0,
+      audioData: new Array(COMPARE_SLOTS).fill(null),
     };
   }
   return state._compareByGroup[gid];
@@ -197,24 +200,42 @@ async function loadAllData() {
     }
   });
 
-  // Restore persisted compare state (alignment offsets + duration) for each group
+  // Restore persisted compare state (alignment offsets + duration + audio data) for each group
   groups.forEach(g => {
-    if (g.compareOffsets && Array.isArray(g.compareOffsets) && g.compareOffsets.some(o => o !== 0)) {
+    const hasState = (g.compareOffsets && Array.isArray(g.compareOffsets) && g.compareOffsets.some(o => o !== 0))
+      || (g.audioData && g.audioData.some(d => d !== null))
+      || (g.commonStart)
+      || (g.compareDuration !== undefined && g.compareDuration !== null);
+    if (hasState) {
       if (!state._compareByGroup[g.id]) {
         state._compareByGroup[g.id] = {
           slots: new Array(COMPARE_SLOTS).fill(null),
           offsets: new Array(COMPARE_SLOTS).fill(0),
           duration: null,
+          commonStart: 0,
+          audioData: new Array(COMPARE_SLOTS).fill(null),
         };
       }
-      state._compareByGroup[g.id].offsets = g.compareOffsets;
+      if (g.compareOffsets) state._compareByGroup[g.id].offsets = g.compareOffsets;
       if (g.compareDuration !== undefined && g.compareDuration !== null) {
         state._compareByGroup[g.id].duration = g.compareDuration;
+      }
+      if (g.commonStart !== undefined) {
+        state._compareByGroup[g.id].commonStart = g.commonStart;
+      }
+      // Restore audio envelope data (convert plain arrays back to Float32Array)
+      if (g.audioData && Array.isArray(g.audioData)) {
+        state._compareByGroup[g.id].audioData = g.audioData.map(d => d ? {
+          ...d,
+          energyEnvelope: new Float32Array(d.energyEnvelope),
+        } : null);
       }
     }
     // Don't keep compare state duplicated on the group object
     delete g.compareOffsets;
     delete g.compareDuration;
+    delete g.commonStart;
+    delete g.audioData;
   });
 
   state.groups = groups;
@@ -249,6 +270,8 @@ async function persistGroup(group) {
     if (existing.compareDuration !== undefined && existing.compareDuration !== null) {
       record.compareDuration = existing.compareDuration;
     }
+    if (existing.commonStart !== undefined) record.commonStart = existing.commonStart;
+    if (existing.audioData) record.audioData = existing.audioData;
   }
   store.put(record);
   return new Promise((resolve, reject) => {
@@ -430,8 +453,19 @@ const compareMasterControl = $('#compareMasterControl');
 const btnFullscreen = $('#btnFullscreen');
 const btnAlignAudio = $('#btnAlignAudio');
 const btnRenderAll = $('#btnRenderAll');
+const btnTimelineToggle = $('#btnTimelineToggle');
 const compareMasterPlayBtn = $('#compareMasterPlayBtn');
 const compareMasterBtnLabel = $('#compareMasterBtnLabel');
+
+// Timeline panel elements
+const timelinePanel = $('#timelinePanel');
+const timelineTracks = $('#timelineTracks');
+const timelineRuler = $('#timelineRuler');
+const timelineScroll = $('#timelineScroll');
+const timelineRangeBar = $('#timelineRangeBar');
+const timelineRangeSelection = $('#timelineRangeSelection');
+const timelineCursor = $('#timelineCursor');
+const timelineZoomLabel = $('#timelineZoomLabel');
 
 const toast = $('#toast');
 const container = $('.container');
@@ -694,6 +728,11 @@ function navigate(view, groupId) {
   // Exit fullscreen if navigating away from compare
   if (viewCompare.classList.contains('compare--fullscreen')) {
     exitCompareFullscreen();
+  }
+  // Hide timeline panel when leaving compare view
+  if (view !== 'compare') {
+    state.timelineVisible = false;
+    stopTimelinePlaybackCursor();
   }
 
   // Remember the group and view we're coming from before switching views
@@ -1608,16 +1647,48 @@ async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
     const duration = Math.min(video.duration || 30, sampleSecs);
     const captureSecs = Math.min(duration, 300); // cap at 5 min for memory safety
 
-    // --- Set up capture stream BEFORE playback ---
-    // CRITICAL: captureStream() + MediaRecorder MUST be set up before play()
-    // so the recorder captures audio from the very first frame. If play()
-    // starts first, the initial audio samples are lost and the recorded
-    // time coordinates diverge from the video's actual timeline — causing
-    // a systematic offset (~1 s on Android) vs primary-method extraction
-    // (which decodes the full audio track with accurate timestamps).
+    // --- Optimised capture strategy ---
+    // Call play() FIRST to prime the audio decoder pipeline, then capture the
+    // stream synchronously while play is still initialising.  This is the best
+    // compromise between the two extremes:
+    //
+    //   play → capture → record        accurate timing, broken on Vivo/Xiaomi
+    //                                     (capture before play returns 0 tracks)
+    //   capture → record → play        works on Vivo, but on some desktop
+    //                                     browsers the stream never produces data
+    //
+    // By interleaving play() (async) with the synchronous capture setup we
+    // satisfy both: the decoder is already priming when captureStream() runs,
+    // but the recorder is armed almost immediately so the t=0 offset stays
+    // negligible.
     video.currentTime = 0;
-    const stream = video.captureStream();
-    const audioTracks = stream.getAudioTracks();
+
+    // Start playback (async — kicks off decoder initialisation)
+    let playOkay = false;
+    const playPromise = video.play().then(() => { playOkay = true; }).catch(playErr => {
+      console.warn('[AudioAlign] 视频元素回退：play() 被拒绝:', playErr.message);
+    });
+
+    // Synchronously capture while play is priming — on desktop/iOS this
+    // returns active tracks immediately; on Vivo it may still be empty.
+    let stream = video.captureStream();
+    let audioTracks = stream.getAudioTracks();
+
+    // If no tracks yet, wait for play to finish and retry (Vivo path)
+    if (audioTracks.length === 0) {
+      console.log('[AudioAlign] 视频元素回退：播放前无音轨，等待播放完成后再捕获…');
+      await playPromise;
+      if (!playOkay) return null;
+      // Small extra wait for decoder to finish initialising
+      await new Promise(r => setTimeout(r, 150));
+      stream = video.captureStream();
+      audioTracks = stream.getAudioTracks();
+    } else {
+      // Tracks are available — wait a tick for play() to settle so the
+      // stream actually carries data (avoid recording silence)
+      await playPromise;
+      if (!playOkay) return null;
+    }
 
     if (audioTracks.length === 0) {
       console.warn('[AudioAlign] 视频元素回退：captureStream 无音轨 — 视频可能没有音频');
@@ -1639,6 +1710,12 @@ async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
     const chunks = [];
     const recorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
 
+    let recorderError = null;
+    recorder.onerror = (e) => {
+      recorderError = e.error || new Error('MediaRecorder 错误');
+      console.warn('[AudioAlign] MediaRecorder 错误:', recorderError.message);
+    };
+
     recorder.ondataavailable = (e) => {
       if (e.data.size > 0) chunks.push(e.data);
     };
@@ -1647,31 +1724,38 @@ async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
       recorder.onstop = resolve;
     });
 
-    // Start recorder BEFORE play() — captures every audio frame from t=0
-    recorder.start();
-
-    // --- Start playback ---
+    // Video is already playing — start recorder immediately
     try {
-      await video.play();
-    } catch (playErr) {
-      recorder.stop(); // clean up
-      console.warn('[AudioAlign] 视频元素回退：play() 被拒绝:', playErr.message);
+      recorder.start();
+    } catch (startErr) {
+      console.warn('[AudioAlign] MediaRecorder.start() 失败:', startErr.message);
+      video.pause();
+      audioTracks.forEach(t => t.stop());
       return null;
     }
 
     // Record for the target duration
     await new Promise(r => setTimeout(r, captureSecs * 1000));
 
-    // Request final data chunk and stop
-    recorder.requestData();
-    recorder.stop();
+    // Some Android browsers (e.g. Vivo) auto-transition the recorder to
+    // 'inactive' when the stream's audio codec can't actually be encoded.
+    // Always check state before calling requestData/stop.
+    if (recorder.state === 'recording') {
+      recorder.requestData();
+      recorder.stop();
+    }
     video.pause();
 
-    // Wait for the final dataavailable / stop event
+    // Wait for the final dataavailable / stop event (if recorder was recording)
     await recorderStopped;
 
     // Detach audio tracks
     audioTracks.forEach(t => t.stop());
+
+    if (recorderError && chunks.length === 0) {
+      console.warn('[AudioAlign] 视频元素回退：MediaRecorder 出错且无数据');
+      return null;
+    }
 
     if (chunks.length === 0) {
       console.warn('[AudioAlign] 视频元素回退：MediaRecorder 未产生数据');
@@ -1953,6 +2037,25 @@ async function performAudioAlignment() {
       }
     }
 
+    // --- Store audio data for manual timeline panel ---
+    // Save energy envelopes (compact) + metadata for waveform rendering.
+    // Raw PCM samples are discarded after alignment to save memory.
+    const groupStore = _ensureCompareGroup(state.compareGroupId);
+    groupStore.audioData = new Array(COMPARE_SLOTS).fill(null);
+    for (const data of valid) {
+      groupStore.audioData[data.slotIdx] = {
+        energyEnvelope: data.env.energies,    // 200ms-window energy (Float32Array)
+        envWindowRate: data.env.windowRate,   // windows per second
+        duration: data.samples.length / data.sampleRate,
+        contentStart: data.contentStart,
+        contentEnd: data.contentEnd,
+        peakEnergy: data.peakEnergy,
+        isSilent: data.isSilent || false,
+        videoName: data.video?.title || `槽位 ${data.slotIdx}`,
+      };
+    }
+    console.log(`[AudioAlign] 已保存 ${valid.length} 个视频的音频包络数据，供手动时间轴使用`);
+
     // If no videos have audio, we can only do a basic play-all
     if (hasAudibleCount === 0) {
       showToast('所有视频均无音频轨道，无法进行音频对齐', 'error');
@@ -2147,6 +2250,9 @@ async function performAudioAlignment() {
       syncAlignButton();
     }
 
+    // Auto-open the timeline panel to show alignment result
+    state.timelineVisible = true;
+
     // Re-render to show the new offsets
     renderCompareView();
   } catch (err) {
@@ -2167,7 +2273,13 @@ function resetAlignButton() {
 function clearAudioAlignment() {
   state.compareOffsets = new Array(COMPARE_SLOTS).fill(0);
   state.compareDuration = null;
-  // Also wipe persisted alignment so stale data doesn't reappear on reload
+  // Also clear audio data and commonStart for manual timeline
+  const groupStore = state.compareGroupId ? state._compareByGroup[state.compareGroupId] : null;
+  if (groupStore) {
+    groupStore.audioData = new Array(COMPARE_SLOTS).fill(null);
+    groupStore.commonStart = 0;
+  }
+  // Also wipe persisted alignment so stale data doesn't appear on reload
   persistCompareState(state.compareGroupId);
   syncAlignButton();
 }
@@ -2192,6 +2304,20 @@ async function persistCompareState(groupId) {
     if (compareState) {
       record.compareOffsets = [...compareState.offsets];
       record.compareDuration = compareState.duration;
+      record.commonStart = compareState.commonStart || 0;
+      // Persist audio envelopes (compact, not raw PCM) for waveform display
+      if (compareState.audioData) {
+        record.audioData = compareState.audioData.map(d => d ? {
+          energyEnvelope: Array.from(d.energyEnvelope),
+          envWindowRate: d.envWindowRate,
+          duration: d.duration,
+          contentStart: d.contentStart,
+          contentEnd: d.contentEnd,
+          peakEnergy: d.peakEnergy,
+          isSilent: d.isSilent,
+          videoName: d.videoName,
+        } : null);
+      }
     }
     store.put(record);
     await new Promise((resolve, reject) => {
@@ -2558,9 +2684,15 @@ function renderCompareView() {
   updateCompareMaster();
   updateRenderButtonState();
   syncAlignButton(); // sync button state with current group's alignment
+  syncTimelineButton(); // sync timeline toggle button state
   // Set filled count for adaptive fullscreen grid
   const filled = state.compareSlots.filter(s => s !== null).length;
   compareSlotsEl.setAttribute('data-filled', filled);
+  // Render timeline panel if visible
+  if (state.timelineVisible) {
+    renderTimelinePanel();
+    startTimelinePlaybackCursor();
+  }
 }
 
 /**
@@ -2951,6 +3083,11 @@ function toggleCompareSlot(video) {
   if (slotIdx !== -1) {
     // Already in a slot — remove it
     state.compareSlots[slotIdx] = null;
+    // Also clear audio data for this slot so the old waveform doesn't linger
+    const gStore = state.compareGroupId ? state._compareByGroup[state.compareGroupId] : null;
+    if (gStore && gStore.audioData) {
+      gStore.audioData[slotIdx] = null;
+    }
   } else {
     // Find first empty slot
     const emptyIdx = state.compareSlots.indexOf(null);
@@ -3005,7 +3142,7 @@ function renderCompareSlots() {
       const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
       if (isNaN(fromIdx) || fromIdx === i) return;
 
-      // Swap the two slots (and their alignment offsets)
+      // Swap the two slots (and their alignment offsets + audio data)
       const temp = state.compareSlots[fromIdx];
       state.compareSlots[fromIdx] = state.compareSlots[i];
       state.compareSlots[i] = temp;
@@ -3013,6 +3150,13 @@ function renderCompareSlots() {
       const tempOffset = state.compareOffsets[fromIdx];
       state.compareOffsets[fromIdx] = state.compareOffsets[i];
       state.compareOffsets[i] = tempOffset;
+
+      const groupStore = state.compareGroupId ? state._compareByGroup[state.compareGroupId] : null;
+      if (groupStore && groupStore.audioData) {
+        const tempAudio = groupStore.audioData[fromIdx];
+        groupStore.audioData[fromIdx] = groupStore.audioData[i];
+        groupStore.audioData[i] = tempAudio;
+      }
 
       // Offsets travel with their videos — no need to re-align
       // Save the swapped state so it survives page reload
@@ -3129,6 +3273,10 @@ function renderCompareSlots() {
       e.stopPropagation();
       state.compareSlots[i] = null;
       state.compareOffsets[i] = 0;
+      const rmStore = state.compareGroupId ? state._compareByGroup[state.compareGroupId] : null;
+      if (rmStore && rmStore.audioData) {
+        rmStore.audioData[i] = null;
+      }
       pauseAllCompareSlots();
       state.compareIsPlaying = false;
       clearAudioAlignment();
@@ -3150,9 +3298,318 @@ function updateCompareMaster() {
 }
 
 compareMasterPlayBtn.addEventListener('click', () => {
-  if (state.compareIsPlaying) { pauseCompareSlots(); }
-  else { playCompareSlots(); }
+  if (state.compareIsPlaying) {
+    pauseCompareSlots();
+  } else {
+    // Set playing state IMMEDIATELY so the toggle responds instantly.
+    // If play fails, playCompareSlots will revert the state.
+    state.compareIsPlaying = true;
+    compareMasterPlayBtn.classList.add('is-playing');
+    compareMasterBtnLabel.textContent = '同步暂停';
+    if (fullscreenPlayBtn) fullscreenPlayBtn.classList.add('is-playing');
+    playCompareSlots();
+  }
 });
+
+// --- Timeline Alignment Panel ---
+const TIMELINE_LABEL_WIDTH = 150; // px — matches .timeline-panel__track-label width in CSS
+
+const timelineView = {
+  pxPerSec: 50,           // pixels per second of audio at 100%
+  minPxPerSec: 5,
+  maxPxPerSec: 500,
+  scrollLeft: 0,          // horizontal scroll offset in pixels
+  totalDuration: 0,       // longest video duration among filled slots
+  commonEnd: 0,           // end of common timeline = max(duration + offset)
+  draggingSlot: null,     // slot index being dragged, or null
+  dragStartX: 0,
+  dragStartOffset: 0,
+  dragRangeHandle: null,  // 'start' | 'end' | null
+};
+
+/**
+ * Get the stored audio data for a slot, or null.
+ */
+function getAudioDataForSlot(slotIdx) {
+  const gid = state.compareGroupId;
+  if (!gid || !state._compareByGroup[gid]) return null;
+  const ad = state._compareByGroup[gid].audioData;
+  if (!ad) return null;
+  return ad[slotIdx] || null;
+}
+
+/**
+ * Render the timeline panel: populate tracks, draw waveforms, range bar, ruler.
+ */
+function renderTimelinePanel() {
+  if (!timelinePanel || !state.timelineVisible) {
+    if (timelinePanel) timelinePanel.style.display = 'none';
+    return;
+  }
+  timelinePanel.style.display = '';
+
+  const gid = state.compareGroupId;
+  const groupStore = gid ? state._compareByGroup[gid] : null;
+  const audioData = groupStore ? groupStore.audioData : null;
+
+  // Collect filled slots that are in the compare slots
+  const filledSlots = [];
+  for (let i = 0; i < COMPARE_SLOTS; i++) {
+    if (state.compareSlots[i] !== null) {
+      filledSlots.push({
+        slotIdx: i,
+        videoId: state.compareSlots[i],
+        offset: state.compareOffsets[i] || 0,
+        audio: audioData ? audioData[i] : null,
+      });
+    }
+  }
+
+  if (filledSlots.length < 1) {
+    timelineTracks.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:0.7rem;">请先添加视频到对比槽位</div>';
+    return;
+  }
+
+  // Determine total duration and offset range for common timeline
+  let maxDuration = 0, maxOffset = 0;
+  for (const s of filledSlots) {
+    const result = findVideo(s.videoId);
+    const dur = result?.video?.duration || 0;
+    if (dur > maxDuration) maxDuration = dur;
+    if (s.offset > maxOffset) maxOffset = s.offset;
+  }
+  if (maxDuration <= 0) maxDuration = 30;
+  timelineView.totalDuration = maxDuration;
+  // Common timeline spans from 0 to the end of the rightmost video
+  const commonEnd = maxDuration + maxOffset;
+  timelineView.commonEnd = commonEnd;
+
+  // Auto-fit pxPerSec to show full common timeline
+  const panelWidth = timelineScroll.clientWidth || 800;
+  timelineView.pxPerSec = Math.max(
+    timelineView.minPxPerSec,
+    Math.min(timelineView.maxPxPerSec, panelWidth / commonEnd)
+  );
+  updateZoomLabel();
+
+  const scrollWidth = TIMELINE_LABEL_WIDTH + commonEnd * timelineView.pxPerSec;
+
+  // Size the range bar to match the scroll content timeline portion.
+  // It lives inside the scroll area now, so its width and margin must
+  // match the ruler / waveforms for percentage-based positioning to align.
+  if (timelineRangeBar) {
+    timelineRangeBar.style.width = (commonEnd * timelineView.pxPerSec) + 'px';
+    timelineRangeBar.style.marginLeft = TIMELINE_LABEL_WIDTH + 'px';
+    timelineRangeBar.style.marginBottom = '2px';
+  }
+
+  // Render tracks — each waveform canvas spans its own duration, positioned via translateX
+  // translateX places the video's time=0 at TIMELINE_LABEL_WIDTH (aligned with ruler zero)
+  let tracksHTML = '';
+  for (const s of filledSlots) {
+    const result = findVideo(s.videoId);
+    const name = result?.video?.title || `槽位 ${s.slotIdx}`;
+    const videoDur = result?.video?.duration || s.audio?.duration || 0;
+    const waveWidth = videoDur * timelineView.pxPerSec;
+    const offsetPx = s.offset * timelineView.pxPerSec;
+    tracksHTML += `
+      <div class="timeline-panel__track" data-slot="${s.slotIdx}">
+        <span class="timeline-panel__track-label" title="${escapeHTML(name)}">${escapeHTML(name)}</span>
+        <div class="timeline-panel__track-wave-wrap" style="width:${scrollWidth}px;">
+          <div class="timeline-panel__track-wave" data-slot="${s.slotIdx}"
+               style="width:${waveWidth}px; transform:translateX(${TIMELINE_LABEL_WIDTH - offsetPx}px);">
+            <canvas class="timeline-panel__track-canvas" data-slot="${s.slotIdx}"></canvas>
+          </div>
+        </div>
+      </div>`;
+  }
+  timelineTracks.innerHTML = tracksHTML;
+
+  // Draw waveforms on each canvas (deferred to next frame for DOM to settle)
+  requestAnimationFrame(() => {
+    for (const s of filledSlots) {
+      const canvas = timelineTracks.querySelector(`.timeline-panel__track-canvas[data-slot="${s.slotIdx}"]`);
+      if (canvas) drawWaveformOnCanvas(canvas, s);
+    }
+    drawRuler(commonEnd);
+    drawRangeBar();
+  });
+}
+
+/**
+ * Draw a single waveform track on its canvas.
+ */
+function drawWaveformOnCanvas(canvas, slotInfo) {
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const w = rect.width;
+  const h = rect.height;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.scale(dpr, dpr);
+
+  ctx.clearRect(0, 0, w, h);
+
+  // Full-width light-gray background — represents the video's entire duration,
+  // so it's clear the bar spans the video, not just the extracted audio.
+  ctx.fillStyle = 'rgba(200,200,200,0.10)';
+  ctx.fillRect(0, 0, w, h);
+
+  const audio = slotInfo.audio;
+  if (!audio || audio.isSilent || !audio.energyEnvelope || audio.energyEnvelope.length === 0) {
+    // Label "无音频" centred on the gray bar
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.font = '0.6rem var(--font-mono)';
+    ctx.textAlign = 'center';
+    ctx.fillText('无音频数据', w / 2, h / 2 + 2);
+    return;
+  }
+
+  const { energyEnvelope, envWindowRate } = audio;
+  const { pxPerSec } = timelineView;
+
+  // Find max energy for normalization
+  let maxEnergy = 0;
+  for (let i = 0; i < energyEnvelope.length; i++) {
+    if (energyEnvelope[i] > maxEnergy) maxEnergy = energyEnvelope[i];
+  }
+  if (maxEnergy < 0.0001) maxEnergy = 0.0001;
+
+  const windowPx = (1 / envWindowRate) * pxPerSec;
+
+  // Draw waveform bars in amber on top of the gray background
+  ctx.fillStyle = 'rgba(226, 176, 74, 0.5)';
+  for (let j = 0; j < energyEnvelope.length; j++) {
+    const t = j / envWindowRate;
+    const x = t * pxPerSec;
+    if (x > w + windowPx) break;
+
+    const normEnergy = energyEnvelope[j] / maxEnergy;
+    const barH = Math.max(1, normEnergy * (h * 0.8));
+    const y = h - barH;
+    ctx.fillRect(x, y, Math.max(1, windowPx - 0.5), barH);
+  }
+
+  // Subtle marker at the video's own time=0 (left edge of the bar)
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, h);
+  ctx.stroke();
+}
+
+/**
+ * Draw time ruler with tick marks.
+ */
+function drawRuler(totalDuration) {
+  const canvas = timelineRuler;
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const scrollWidth = TIMELINE_LABEL_WIDTH + totalDuration * timelineView.pxPerSec;
+  const h = 18;
+  canvas.width = scrollWidth * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = scrollWidth + 'px';
+  canvas.style.height = h + 'px';
+  ctx.scale(dpr, dpr);
+
+  ctx.clearRect(0, 0, scrollWidth, h);
+
+  // Determine tick interval based on zoom
+  const { pxPerSec } = timelineView;
+  let tickInterval; // in seconds
+  if (pxPerSec >= 200) tickInterval = 0.5;
+  else if (pxPerSec >= 100) tickInterval = 1;
+  else if (pxPerSec >= 40) tickInterval = 2;
+  else if (pxPerSec >= 20) tickInterval = 5;
+  else if (pxPerSec >= 10) tickInterval = 10;
+  else tickInterval = 30;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.font = '0.52rem var(--font-mono)';
+  ctx.textAlign = 'center';
+
+  for (let t = 0; t <= totalDuration; t += tickInterval) {
+    const x = TIMELINE_LABEL_WIDTH + t * pxPerSec;
+    // Major tick
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, h - 8);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+
+    // Label
+    ctx.fillText(formatTimelineTime(t), x, h - 10);
+  }
+
+  // Draw a subtle marker at time=0
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(TIMELINE_LABEL_WIDTH, 0);
+  ctx.lineTo(TIMELINE_LABEL_WIDTH, h);
+  ctx.stroke();
+}
+
+/**
+ * Draw the range selection bar.
+ */
+function drawRangeBar() {
+  const bar = timelineRangeBar;
+  const sel = timelineRangeSelection;
+  if (!bar || !sel) return;
+
+  const gid = state.compareGroupId;
+  const groupStore = gid ? state._compareByGroup[gid] : null;
+  const commonStart = groupStore ? (groupStore.commonStart || 0) : 0;
+  const commonDur = state.compareDuration || timelineView.commonEnd;
+
+  const fullDur = timelineView.commonEnd || timelineView.totalDuration;
+  if (fullDur <= 0) return;
+
+  const startPct = (commonStart / fullDur) * 100;
+  const endPct = ((commonStart + commonDur) / fullDur) * 100;
+
+  sel.style.left = startPct + '%';
+  sel.style.width = Math.max(0, endPct - startPct) + '%';
+}
+
+/**
+ * Update the zoom percentage label.
+ */
+function updateZoomLabel() {
+  if (!timelineZoomLabel) return;
+  const { pxPerSec, totalDuration } = timelineView;
+  const panelWidth = timelineScroll.clientWidth || 800;
+  const fitPxPerSec = totalDuration > 0 ? panelWidth / totalDuration : 50;
+  const pct = Math.round((pxPerSec / Math.max(1, fitPxPerSec)) * 100);
+  timelineZoomLabel.textContent = pct + '%';
+}
+
+/**
+ * Escape HTML entities for safe DOM insertion.
+ */
+function escapeHTML(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+/**
+ * Format seconds as m:ss or mm:ss.
+ */
+function formatTimelineTime(secs) {
+  if (!isFinite(secs) || secs < 0) return '0:00';
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
 
 // --- Compare Fullscreen ---
 let fullscreenExitBtn = null;
@@ -3213,11 +3670,23 @@ function formatProgressTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-/** Total duration shown on the progress bar (common timeline). */
+/** Get the range-bar start offset (seconds on the common timeline). */
+function getCommonStart() {
+  const gid = state.compareGroupId;
+  const groupStore = gid ? state._compareByGroup[gid] : null;
+  return groupStore ? (groupStore.commonStart || 0) : 0;
+}
+
+/** Total duration shown on the progress bar (playback window). */
 function getProgressDuration() {
-  const hasAlignment = state.compareDuration && state.compareDuration > 0
-    && state.compareOffsets.some(o => o !== 0);
-  if (hasAlignment) return state.compareDuration;
+  // When a playback window is defined (via alignment or range bar), use it
+  if (state.compareDuration && state.compareDuration > 0) {
+    return state.compareDuration;
+  }
+  const commonStart = getCommonStart();
+  if (commonStart > 0 && timelineView.commonEnd > commonStart) {
+    return timelineView.commonEnd - commonStart;
+  }
   // Non-aligned: longest video duration
   let maxDur = 0;
   const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
@@ -3228,8 +3697,9 @@ function getProgressDuration() {
   return maxDur || 0;
 }
 
-/** Current position on the common timeline (seconds). */
+/** Current position within the playback window (seconds). */
 function getProgressPosition() {
+  const commonStart = getCommonStart();
   // Use the first filled slot's video to read the common-timeline position
   const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
   for (const slotEl of slotEls) {
@@ -3237,24 +3707,27 @@ function getProgressPosition() {
     if (video && video.currentTime > 0) {
       const slotIdx = parseInt(slotEl.dataset.slot);
       const offset = state.compareOffsets[slotIdx] || 0;
-      return Math.max(0, video.currentTime - offset);
+      return Math.max(0, video.currentTime - offset - commonStart);
     }
   }
   return 0;
 }
 
-/** Seek all videos to a given position on the common timeline. */
+/** Seek all videos to a given position within the playback window. */
 function seekAllToTimeline(targetSeconds) {
-  const hasAlignment = state.compareDuration && state.compareDuration > 0
-    && state.compareOffsets.some(o => o !== 0);
+  // User manually chose a position — next play resumes from here
+  _playbackEnded = false;
+
+  const commonStart = getCommonStart();
+  const hasOffsets = state.compareOffsets.some(o => o !== 0);
 
   const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
   slotEls.forEach(slotEl => {
     const video = slotEl.querySelector('video');
     if (!video) return;
     const slotIdx = parseInt(slotEl.dataset.slot);
-    const offset = hasAlignment ? (state.compareOffsets[slotIdx] || 0) : 0;
-    const seekTarget = offset + targetSeconds;
+    const offset = (hasOffsets || commonStart > 0) ? (state.compareOffsets[slotIdx] || 0) : 0;
+    const seekTarget = offset + commonStart + targetSeconds;
     if (seekTarget >= 0 && seekTarget < (video.duration || Infinity)) {
       video.currentTime = seekTarget;
     }
@@ -3463,6 +3936,9 @@ function exitCompareFullscreen() {
   // Stop any ongoing export recording
   if (exportRecording) stopExportRecording();
 
+  // Pause all videos before layout change to prevent state corruption
+  pauseCompareSlots();
+
   viewCompare.classList.remove('compare--fullscreen');
   if (fullscreenExitBtn) fullscreenExitBtn.remove();
   fullscreenExitBtn = null;
@@ -3487,6 +3963,19 @@ function exitCompareFullscreen() {
   document.body.style.overflow = '';
   compareSlotsEl.style.width = '';
   compareSlotsEl.style.height = '';
+
+  // Re-apply rotation transforms — exiting fullscreen reset the container
+  // size, but rotated videos still have absolute positioning / dimensions
+  // calculated for the fullscreen layout.  Without this they overflow the
+  // normal-size slots and appear stuck in "enlarged" state.
+  compareSlotsEl.querySelectorAll('.compare-slot__inner video[data-rotated]').forEach(video => {
+    const inner = video.closest('.compare-slot__inner');
+    const angle = parseInt(video.getAttribute('data-rotation'));
+    if (inner && angle) {
+      applyRotationTransform(video, inner, angle);
+    }
+  });
+
   window.removeEventListener('resize', fitFullscreenGrid);
 }
 
@@ -3495,6 +3984,325 @@ btnFullscreen.addEventListener('click', () => {
     exitCompareFullscreen();
   } else {
     enterCompareFullscreen();
+  }
+});
+
+// --- Timeline Panel Event Handlers ---
+
+// Toggle timeline panel visibility
+btnTimelineToggle.addEventListener('click', () => {
+  state.timelineVisible = !state.timelineVisible;
+  if (state.timelineVisible) {
+    renderTimelinePanel();
+    startTimelinePlaybackCursor();
+  } else {
+    stopTimelinePlaybackCursor();
+  }
+  syncTimelineButton();
+});
+
+// Sync the timeline button visual state
+function syncTimelineButton() {
+  if (!btnTimelineToggle) return;
+  if (state.timelineVisible) {
+    btnTimelineToggle.classList.add('is-active');
+  } else {
+    btnTimelineToggle.classList.remove('is-active');
+  }
+}
+
+// Zoom button delegation
+timelinePanel.addEventListener('click', (e) => {
+  const btn = e.target.closest('.timeline-panel__zoom-btn');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  if (action === 'zoom-in') {
+    timelineView.pxPerSec = Math.min(timelineView.maxPxPerSec, timelineView.pxPerSec * 2);
+  } else if (action === 'zoom-out') {
+    timelineView.pxPerSec = Math.max(timelineView.minPxPerSec, timelineView.pxPerSec / 2);
+  } else if (action === 'zoom-fit') {
+    const panelWidth = timelineScroll.clientWidth || 800;
+    const fullDur = timelineView.commonEnd || timelineView.totalDuration;
+    timelineView.pxPerSec = Math.max(timelineView.minPxPerSec,
+      Math.min(timelineView.maxPxPerSec, panelWidth / Math.max(1, fullDur)));
+  }
+  updateZoomLabel();
+  renderTimelinePanel();
+});
+
+// Track dragging — pointer events delegation on tracks container.
+// Dragging the waveform bar LEFT  → offset decreases (video starts earlier)
+// Dragging the waveform bar RIGHT → offset increases (video starts later)
+timelineTracks.addEventListener('pointerdown', (e) => {
+  const trackWave = e.target.closest('.timeline-panel__track-wave');
+  if (!trackWave) return;
+  const track = trackWave.closest('.timeline-panel__track');
+  if (!track) return;
+  const slotIdx = parseInt(track.dataset.slot);
+  if (isNaN(slotIdx)) return;
+
+  timelineView.draggingSlot = slotIdx;
+  timelineView.dragStartX = e.clientX;
+  timelineView.dragStartOffset = state.compareOffsets[slotIdx] || 0;
+  trackWave.style.transition = 'none';
+  track.classList.add('dragging');
+  trackWave.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+
+document.addEventListener('pointermove', (e) => {
+  if (timelineView.draggingSlot === null) return;
+  const slotIdx = timelineView.draggingSlot;
+  const deltaPx = e.clientX - timelineView.dragStartX;
+  const deltaSec = deltaPx / timelineView.pxPerSec;
+  // translateX = -offset * pxPerSec
+  // drag right → translateX更不负 → offset变小 → 视频从更早的时间开始播
+  let newOffset = timelineView.dragStartOffset - deltaSec;
+
+  const result = findVideo(state.compareSlots[slotIdx]);
+  const videoDur = result?.video?.duration || 0;
+  newOffset = Math.max(-videoDur, Math.min(3600, newOffset));
+  newOffset = Math.round(newOffset * 100) / 100;
+
+  if (state.compareOffsets[slotIdx] !== newOffset) {
+    state.compareOffsets[slotIdx] = newOffset;
+    // Update the waveform position in real-time via translateX
+    const trackWave = timelineTracks.querySelector(`.timeline-panel__track-wave[data-slot="${slotIdx}"]`);
+    if (trackWave) {
+      trackWave.style.transform = `translateX(${TIMELINE_LABEL_WIDTH - newOffset * timelineView.pxPerSec}px)`;
+    }
+  }
+});
+
+document.addEventListener('pointerup', (e) => {
+  if (timelineView.draggingSlot === null) return;
+  const slotIdx = timelineView.draggingSlot;
+  const track = timelineTracks.querySelector(`.timeline-panel__track[data-slot="${slotIdx}"]`);
+  if (track) track.classList.remove('dragging');
+  const trackWave = timelineTracks.querySelector(`.timeline-panel__track-wave[data-slot="${slotIdx}"]`);
+  if (trackWave) {
+    trackWave.style.transition = 'transform 0.15s ease-out';
+  }
+  timelineView.draggingSlot = null;
+  persistCompareState(state.compareGroupId);
+  // Full re-render to update ruler, range bar, other tracks
+  renderTimelinePanel();
+});
+
+// Range handle dragging
+timelineRangeBar.addEventListener('pointerdown', (e) => {
+  e.stopPropagation(); // prevent click from bubbling to scroll area (which would seek)
+  const barRect = timelineRangeBar.getBoundingClientRect();
+  const clickPct = (e.clientX - barRect.left) / barRect.width;
+  const gid = state.compareGroupId;
+  const groupStore = gid ? state._compareByGroup[gid] : null;
+  const fullDur = timelineView.commonEnd || timelineView.totalDuration;
+  const commonStart = groupStore ? (groupStore.commonStart || 0) : 0;
+  const commonDur = state.compareDuration || fullDur;
+
+  const startPct = commonStart / fullDur;
+  const endPct = (commonStart + commonDur) / fullDur;
+
+  // Determine which handle is closer (within 3% of bar width)
+  const distToStart = Math.abs(clickPct - startPct);
+  const distToEnd = Math.abs(clickPct - endPct);
+
+  if (distToStart < 0.03 || (distToStart < distToEnd && distToStart < 0.08)) {
+    timelineView.dragRangeHandle = 'start';
+  } else if (distToEnd < 0.03 || distToEnd < 0.08) {
+    timelineView.dragRangeHandle = 'end';
+  } else if (clickPct > startPct && clickPct < endPct) {
+    // Click inside range — drag the whole range (move both handles)
+    timelineView.dragRangeHandle = 'both';
+    timelineView.dragStartX = clickPct;
+    timelineView._dragRangeCommonStart = commonStart;
+  }
+  if (timelineView.dragRangeHandle) {
+    timelineRangeBar.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+});
+
+document.addEventListener('pointermove', (e) => {
+  if (!timelineView.dragRangeHandle) return;
+  const barRect = timelineRangeBar.getBoundingClientRect();
+  const clickPct = Math.max(0, Math.min(1, (e.clientX - barRect.left) / barRect.width));
+  const fullDur = timelineView.commonEnd || timelineView.totalDuration;
+  const clickTime = clickPct * fullDur;
+
+  const gid = state.compareGroupId;
+  const groupStore = gid ? state._compareByGroup[gid] : null;
+  if (!groupStore) return;
+
+  let commonStart = groupStore.commonStart || 0;
+  let commonDur = state.compareDuration || fullDur;
+  const commonEnd = commonStart + commonDur;
+
+  if (timelineView.dragRangeHandle === 'start') {
+    commonStart = Math.max(0, Math.min(commonEnd - 0.1, clickTime));
+    groupStore.commonStart = Math.round(commonStart * 100) / 100;
+  } else if (timelineView.dragRangeHandle === 'end') {
+    const newEnd = Math.max(commonStart + 0.1, clickTime);
+    commonDur = newEnd - commonStart;
+    state.compareDuration = Math.round(commonDur * 100) / 100;
+  } else if (timelineView.dragRangeHandle === 'both') {
+    const deltaPct = clickPct - timelineView.dragStartX;
+    const deltaSec = deltaPct * fullDur;
+    const newStart = timelineView._dragRangeCommonStart + deltaSec;
+    commonStart = Math.max(0, newStart);
+    groupStore.commonStart = Math.round(commonStart * 100) / 100;
+  }
+
+  drawRangeBar();
+});
+
+document.addEventListener('pointerup', () => {
+  if (timelineView.dragRangeHandle) {
+    persistCompareState(state.compareGroupId);
+    timelineView.dragRangeHandle = null;
+    // Apply to offsets: add commonStart as uniform shift
+    applyRangeToOffsets();
+  }
+});
+
+/**
+ * Apply the range start as a uniform shift to all offsets.
+ * This ensures playback starts at the range start boundary.
+ */
+function applyRangeToOffsets() {
+  // The range start is a global shift; we handle this during playback by
+  // reading commonStart alongside compareOffsets. No need to mutate offsets.
+  drawRangeBar();
+}
+
+// Sync scroll between ruler canvas and tracks
+timelineScroll.addEventListener('scroll', () => {
+  timelineView.scrollLeft = timelineScroll.scrollLeft;
+});
+
+// --- Timeline playback cursor ---
+let timelineCursorRAF = null;
+let cursorDragActive = false;
+
+function startTimelinePlaybackCursor() {
+  if (timelineCursorRAF) return;
+  function tick() {
+    if (!state.timelineVisible || !timelinePanel || timelinePanel.style.display === 'none') {
+      stopTimelinePlaybackCursor();
+      return;
+    }
+    if (!cursorDragActive) {
+      updateTimelineCursor();
+    }
+    timelineCursorRAF = requestAnimationFrame(tick);
+  }
+  timelineCursorRAF = requestAnimationFrame(tick);
+}
+
+function stopTimelinePlaybackCursor() {
+  if (timelineCursorRAF) {
+    cancelAnimationFrame(timelineCursorRAF);
+    timelineCursorRAF = null;
+  }
+  if (timelineCursor) timelineCursor.style.display = 'none';
+}
+
+/**
+ * Return the current common-timeline position in seconds.
+ * Uses the first video that has valid currentTime.
+ */
+function getTimelinePosition() {
+  const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
+  for (const slotEl of slotEls) {
+    const video = slotEl.querySelector('video');
+    if (video && video.duration > 0) {
+      const slotIdx = parseInt(slotEl.dataset.slot);
+      const offset = state.compareOffsets[slotIdx] || 0;
+      return video.currentTime - offset;
+    }
+  }
+  return -1;
+}
+
+function updateTimelineCursor() {
+  if (!timelineCursor) return;
+  const pos = getTimelinePosition();
+  if (pos < 0) {
+    timelineCursor.style.display = 'none';
+    return;
+  }
+
+  const cursorPx = TIMELINE_LABEL_WIDTH + pos * timelineView.pxPerSec;
+  timelineCursor.style.display = 'block';
+  timelineCursor.style.left = cursorPx + 'px';
+  // Show time label
+  const timeLabel = timelineCursor.querySelector('.timeline-panel__cursor-time');
+  if (timeLabel) timeLabel.textContent = formatTimelineTime(pos);
+}
+
+/**
+ * Seek all videos to a common-timeline time.
+ */
+function seekTimelineTo(commonTime) {
+  // User manually dragged cursor / clicked timeline — resume from here
+  _playbackEnded = false;
+
+  commonTime = Math.max(0, commonTime);
+  const slotEls = compareSlotsEl.querySelectorAll('.compare-slot.has-video');
+  for (const slotEl of slotEls) {
+    const video = slotEl.querySelector('video');
+    if (video && video.duration > 0) {
+      const slotIdx = parseInt(slotEl.dataset.slot);
+      const offset = state.compareOffsets[slotIdx] || 0;
+      const target = Math.max(0, Math.min(video.duration, offset + commonTime));
+      video.currentTime = target;
+    }
+  }
+  updateTimelineCursor();
+}
+
+// Cursor drag
+if (timelineCursor) {
+  timelineCursor.addEventListener('pointerdown', (e) => {
+    cursorDragActive = true;
+    timelineCursor.classList.add('dragging');
+    timelineCursor.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    e.stopPropagation();
+  });
+}
+
+// Click on scroll area (ruler or tracks) to seek
+timelineScroll.addEventListener('pointerdown', (e) => {
+  // Don't interfere with track dragging
+  if (timelineView.draggingSlot !== null) return;
+  if (e.target.closest('.timeline-panel__track-wave')) return;
+
+  const scrollRect = timelineScroll.getBoundingClientRect();
+  const clickX = e.clientX - scrollRect.left + timelineView.scrollLeft - TIMELINE_LABEL_WIDTH;
+  const commonTime = clickX / timelineView.pxPerSec;
+  seekTimelineTo(commonTime);
+
+  // Also start cursor drag for continuous scrubbing
+  cursorDragActive = true;
+  timelineCursor.classList.add('dragging');
+  timelineCursor.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+
+// Cursor and scroll-area drag move
+document.addEventListener('pointermove', (e) => {
+  if (!cursorDragActive) return;
+  const scrollRect = timelineScroll.getBoundingClientRect();
+  const dragX = e.clientX - scrollRect.left + timelineView.scrollLeft - TIMELINE_LABEL_WIDTH;
+  const commonTime = Math.max(0, dragX / timelineView.pxPerSec);
+  seekTimelineTo(commonTime);
+});
+
+document.addEventListener('pointerup', () => {
+  if (cursorDragActive) {
+    cursorDragActive = false;
+    timelineCursor.classList.remove('dragging');
   }
 });
 
@@ -3511,6 +4319,11 @@ function toggleFullscreenPlay() {
   if (state.compareIsPlaying) {
     pauseCompareSlots();
   } else {
+    // Set playing state IMMEDIATELY so the toggle responds instantly
+    state.compareIsPlaying = true;
+    compareMasterPlayBtn.classList.add('is-playing');
+    compareMasterBtnLabel.textContent = '同步暂停';
+    if (fullscreenPlayBtn) fullscreenPlayBtn.classList.add('is-playing');
     playCompareSlots();
   }
 }
@@ -4339,6 +5152,8 @@ exportModalConfirm.addEventListener('click', () => {
 });
 
 let _comparePlaybackTimer = null;
+let _playbackEnded = true; // true when playback hasn't started or has run to completion
+let _staggerTimers = [];    // individual video start-delay timeouts (staggered playback)
 
 /**
  * Wait for a video to be ready to seek (metadata loaded) and seek to a position.
@@ -4384,78 +5199,153 @@ async function playCompareSlots() {
   const slots = compareSlotsEl.querySelectorAll('.compare-slot');
   const offsets = state.compareOffsets;
   const commonDur = state.compareDuration;
-  const hasOffsets = offsets.some(o => o !== 0) || commonDur !== null;
+  const commonStart = getCommonStart();
+  const hasOffsets = offsets.some(o => o !== 0) || commonDur !== null || commonStart > 0;
 
   // Clear any previous end-of-playback timer
   if (_comparePlaybackTimer) { clearTimeout(_comparePlaybackTimer); _comparePlaybackTimer = null; }
 
-  // --- Step 1: seek all videos to their aligned positions ---
+  // --- Step 1: gather videos and seek to aligned positions ---
+  // Only seek when starting from scratch (first play or playback ended).
+  // When resuming from a user-initiated pause, keep the current position.
   const videos = [];
   const seekPromises = [];
+  const shouldSeek = _playbackEnded;
+  _playbackEnded = false;
 
-  slots.forEach((slot, i) => {
-    const video = slot.querySelector('video');
-    if (video) {
+  if (shouldSeek) {
+    slots.forEach((slot, i) => {
+      const video = slot.querySelector('video');
+      if (!video) return;
       videos.push(video);
-      const startTime = hasOffsets ? Math.max(0, offsets[i] || 0) : 0;
+
+      // Ensure video is loadable — if src is broken, skip with warning
+      if (video.readyState === 0 && video.networkState === 3) {
+        // networkState 3 = NETWORK_NO_SOURCE — video has no/invalid source
+        console.warn(`[Compare] 槽位 ${i}: 视频未加载，跳过`);
+        return;
+      }
+
+      const startTime = hasOffsets ? Math.max(0, (offsets[i] || 0) + commonStart) : commonStart;
       if (startTime > 0 && startTime < (video.duration || Infinity)) {
-        console.log(`[Compare] 槽位 ${i}: seek 到 ${startTime.toFixed(2)}s (视频总长 ${video.duration?.toFixed(1) || '未知'}s, 偏移=${offsets[i]?.toFixed(2) || 0}s)`);
+        console.log(`[Compare] 槽位 ${i}: seek 到 ${startTime.toFixed(2)}s (偏移=${offsets[i]?.toFixed(2) || 0}s, commonStart=${commonStart.toFixed(2)}s)`);
         seekPromises.push(waitForReadyAndSeek(video, startTime));
       } else {
         console.log(`[Compare] 槽位 ${i}: 从头播放 (startTime=${startTime}, duration=${video.duration})`);
       }
-    }
-  });
+    });
+  } else {
+    // Resuming from pause — just collect video references, no seeking
+    slots.forEach((slot, i) => {
+      const video = slot.querySelector('video');
+      if (!video) return;
+      videos.push(video);
+      if (video.readyState === 0 && video.networkState === 3) {
+        console.warn(`[Compare] 槽位 ${i}: 视频未加载，跳过`);
+        return;
+      }
+    });
+  }
+
+  // No loadable videos at all — revert state immediately
+  if (videos.length === 0) {
+    console.warn('[Compare] 无可播放的视频，取消');
+    pauseCompareSlots();
+    return;
+  }
 
   // Wait for all seeks to complete before playing
   if (seekPromises.length > 0) {
     console.log(`[Compare] 等待 ${seekPromises.length} 个视频 seek 到位…`);
     await Promise.all(seekPromises);
-    // Verify seeks actually happened
+    // Verify seeks and retry if needed
     slots.forEach((slot, i) => {
       const video = slot.querySelector('video');
-      if (video) {
-        const targetTime = hasOffsets ? Math.max(0, offsets[i] || 0) : 0;
-        const actualTime = video.currentTime;
-        if (targetTime > 0) {
-          console.log(`[Compare] 槽位 ${i} seek 验证: 目标=${targetTime.toFixed(2)}s, 实际=${actualTime.toFixed(2)}s, 误差=${(Math.abs(actualTime - targetTime) * 1000).toFixed(0)}ms`);
+      if (!video) return;
+      const targetTime = hasOffsets ? Math.max(0, (offsets[i] || 0) + commonStart) : commonStart;
+      const actualTime = video.currentTime;
+      if (targetTime > 0) {
+        const errMs = Math.abs(actualTime - targetTime) * 1000;
+        console.log(`[Compare] 槽位 ${i} seek 验证: 目标=${targetTime.toFixed(2)}s, 实际=${actualTime.toFixed(2)}s, 误差=${errMs.toFixed(0)}ms`);
+        // Retry seek if it landed far off (> 500ms error)
+        if (errMs > 500) {
+          console.warn(`[Compare] 槽位 ${i}: seek 偏差过大 (${errMs.toFixed(0)}ms)，重试…`);
+          video.currentTime = targetTime;
         }
       }
     });
     console.log('[Compare] 所有 seek 完成，同步播放');
   }
 
-  // --- Step 2: play all videos simultaneously ---
-  const playResults = await Promise.allSettled(
+  // --- Step 2: ensure videos are playable ---
+  // Wait up to 3s for each video to have enough data buffered
+  await Promise.all(videos.map(async (video, idx) => {
+    if (video.readyState >= 2) return; // HAVE_CURRENT_DATA or better
+    // Wait for canplay or timeout
+    let resolved = false;
+    await new Promise(resolve => {
+      const onReady = () => { if (!resolved) { resolved = true; resolve(); } };
+      video.addEventListener('canplay', onReady, { once: true });
+      video.addEventListener('loadeddata', onReady, { once: true });
+      setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, 3000);
+    });
+  }));
+
+  // --- Step 3: play all videos simultaneously, with retry ---
+  let playResults = await Promise.allSettled(
     videos.map(video => video.play())
   );
-  const started = playResults.some(r => r.status === 'fulfilled');
 
-  // Log any failures
+  // Retry failed videos once after a brief delay (decoder may need more time)
+  const retryIndices = [];
   playResults.forEach((r, idx) => {
     if (r.status === 'rejected') {
-      console.warn(`[Compare] 槽位 ${idx} 播放失败:`, r.reason?.message);
+      retryIndices.push(idx);
+      console.warn(`[Compare] 槽位 ${idx} 首次播放失败:`, r.reason?.message);
     }
   });
 
-  // --- Step 3: schedule auto-pause ---
+  if (retryIndices.length > 0) {
+    await new Promise(r => setTimeout(r, 200));
+    const retryResults = await Promise.allSettled(
+      retryIndices.map(idx => videos[idx].play())
+    );
+    retryResults.forEach((r, ri) => {
+      const idx = retryIndices[ri];
+      playResults[idx] = r; // replace original result
+      if (r.status === 'rejected') {
+        console.warn(`[Compare] 槽位 ${idx} 重试仍然失败:`, r.reason?.message);
+      } else {
+        console.log(`[Compare] 槽位 ${idx} 重试成功`);
+      }
+    });
+  }
+
+  const started = playResults.some(r => r.status === 'fulfilled');
+
+  // --- Step 4: schedule auto-pause ---
   if (commonDur && commonDur > 0 && started) {
     _comparePlaybackTimer = setTimeout(() => {
+      _playbackEnded = true; // playback ran to completion — next play restarts from beginning
       pauseCompareSlots();
       _comparePlaybackTimer = null;
     }, commonDur * 1000);
   }
 
   if (started) {
-    state.compareIsPlaying = true;
-    compareMasterPlayBtn.classList.add('is-playing');
-    compareMasterBtnLabel.textContent = '同步暂停';
+    // State was already set by the click handler — just sync fullscreen button
     if (fullscreenPlayBtn) fullscreenPlayBtn.classList.add('is-playing');
+  } else {
+    // All videos failed to play — revert the optimistic state
+    console.warn('[Compare] 所有视频播放失败，回退播放状态');
+    pauseCompareSlots();
   }
 }
 
 function pauseCompareSlots() {
   if (_comparePlaybackTimer) { clearTimeout(_comparePlaybackTimer); _comparePlaybackTimer = null; }
+  _staggerTimers.forEach(t => clearTimeout(t));
+  _staggerTimers = [];
   const slots = compareSlotsEl.querySelectorAll('.compare-slot');
   slots.forEach(slot => { const v = slot.querySelector('video'); if (v) v.pause(); });
   state.compareIsPlaying = false;
@@ -4466,11 +5356,15 @@ function pauseCompareSlots() {
 
 function pauseAllCompareSlots() {
   if (_comparePlaybackTimer) { clearTimeout(_comparePlaybackTimer); _comparePlaybackTimer = null; }
+  _staggerTimers.forEach(t => clearTimeout(t));
+  _staggerTimers = [];
   const slots = compareSlotsEl.querySelectorAll('.compare-slot');
   slots.forEach(slot => {
     const v = slot.querySelector('video');
     if (v) { v.pause(); v.remove(); }
   });
+  // Video elements are destroyed — next play must be a fresh start with seeking.
+  _playbackEnded = true;
 }
 
 // ============================================
