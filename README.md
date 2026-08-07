@@ -1,4 +1,4 @@
-# FilmArchive — 视频搜集、分组、对比工具
+# ShotSync — 视频搜集、分组、对比工具
 
 浏览器端的视频管理与多路对比工具。支持将视频按场景分组，通过**自动音频对齐**和**手动音轨编辑器**实现跨设备拍摄素材的精准同步播放。
 
@@ -97,7 +97,7 @@ bash run.sh        # macOS / Linux
 │   ├─ 音轨编辑器面板（时间轴 + 波形 + 区间条）
 │   ├─ 全屏对比模式
 │   └─ 导出模态框
-└─ IndexedDB ─────── FilmArchive v3
+└─ IndexedDB ─────── ShotSync v3
     ├─ objectStore: groups
     └─ objectStore: videos
 ```
