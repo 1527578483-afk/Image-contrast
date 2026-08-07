@@ -2848,6 +2848,7 @@ function renderCompareGroupTree() {
 			}
 			// Otherwise → select this group
 			state.compareGroupId = root.id;
+			localStorage.setItem('compareGroupId', root.id);
 			pauseAllCompareSlots();
 			state.compareIsPlaying = false;
 			renderCompareView();
@@ -2932,6 +2933,7 @@ function renderCompareGroupTree() {
 						return;
 					}
 					state.compareGroupId = child.id;
+					localStorage.setItem('compareGroupId', child.id);
 					pauseAllCompareSlots();
 					state.compareIsPlaying = false;
 					renderCompareView();
@@ -2991,6 +2993,7 @@ function renderCompareGroupTree() {
 
 						gcFolder.addEventListener('click', () => {
 							state.compareGroupId = gc.id;
+							localStorage.setItem('compareGroupId', gc.id);
 							pauseAllCompareSlots();
 							state.compareIsPlaying = false;
 							renderCompareView();
@@ -3058,6 +3061,7 @@ function renderCompareGroupTree() {
 
 		folder.addEventListener('click', () => {
 			state.compareGroupId = g.id;
+			localStorage.setItem('compareGroupId', g.id);
 			pauseAllCompareSlots();
 			state.compareIsPlaying = false;
 			renderCompareView();
@@ -3385,6 +3389,19 @@ function renderTimelinePanel() {
 
   if (filledSlots.length < 1) {
     timelineTracks.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:0.7rem;">请先添加视频到对比槽位</div>';
+    // Clear range bar and ruler so stale data from previous group doesn't show
+    if (timelineRangeBar) {
+      timelineRangeBar.style.width = '0px';
+    }
+    if (timelineRangeSelection) {
+      timelineRangeSelection.style.left = '0%';
+      timelineRangeSelection.style.width = '0%';
+    }
+    if (timelineRuler) {
+      const ctx = timelineRuler.getContext('2d');
+      ctx.clearRect(0, 0, timelineRuler.width, timelineRuler.height);
+      timelineRuler.style.width = '0px';
+    }
     return;
   }
 
