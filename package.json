@@ -1,0 +1,59 @@
+{
+  "name": "filmarchive",
+  "version": "1.0.0",
+  "description": "视频档案 — 视频搜集、分组、对比工具",
+  "main": "main.js",
+  "scripts": {
+    "start": "unset ELECTRON_RUN_AS_NODE && electron .",
+    "migrate-server": "node migrate-server.js",
+    "build": "unset ELECTRON_RUN_AS_NODE && electron-builder",
+    "build:mac": "unset ELECTRON_RUN_AS_NODE && electron-builder --mac",
+    "build:win": "unset ELECTRON_RUN_AS_NODE && electron-builder --win"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "classic-level": "^3.0.0",
+    "electron": "^28.3.3",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.filmarchive.app",
+    "productName": "视频档案",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "migrate.html",
+      "migrate-server.js",
+      "script.js",
+      "style.css",
+      "mp4-muxer.js",
+      "mp4-muxer.mjs",
+      "fonts/**/*",
+      "build/icon.*"
+    ],
+    "mac": {
+      "category": "public.app-category.photography",
+      "icon": "build/icon.png",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

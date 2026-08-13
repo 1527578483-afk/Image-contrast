@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>数据迁移 — 视频档案</title>
+<style>
+  :root { --bg: #0d0d0d; --card: #1a1a1a; --text: #e0e0e0; --gold: #e2b04a; --green: #5b8c5a; --red: #c95a4a; --blue: #6b8cbf; --muted: #888; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px; background: var(--bg); color: var(--text); }
+  h1 { color: var(--gold); font-size: 1.3rem; margin-bottom: 8px; }
+  .status-row { display: flex; gap: 12px; align-items: center; margin-bottom: 24px; }
+  .status-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .dot-ok { background: var(--green); box-shadow: 0 0 8px rgba(91,140,90,0.5); }
+  .dot-err { background: var(--red); }
+  .dot-busy { background: var(--gold); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .status-text { font-size: 13px; color: var(--muted); }
+  .card { background: var(--card); padding: 20px; border-radius: 10px; margin: 16px 0; border: 1px solid rgba(255,255,255,0.06); }
+  .card h2 { font-size: 1rem; margin: 0 0 8px 0; color: var(--text); }
+  .btn { display: block; width: 100%; padding: 13px; margin: 8px 0; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: 600; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-e { background: var(--gold); color: #0d0d0d; }
+  .btn-i { background: var(--green); color: #fff; }
+  .btn-auto { background: #c95a4a; color: #fff; }
+  .log { background: #050505; padding: 14px; border-radius: 6px; font-family: 'Menlo', 'JetBrains Mono', 'SF Mono', monospace; font-size: 11px; max-height: 380px; overflow-y: auto; line-height: 1.7; white-space: pre-wrap; word-break: break-all; }
+  .log .err { color: var(--red); }
+  .log .ok { color: var(--green); }
+  .log .info { color: var(--blue); }
+  .log .warn { color: var(--gold); }
+  .progress { width: 100%; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; margin: 8px 0; overflow: hidden; }
+  .progress-bar { height: 100%; background: var(--gold); border-radius: 2px; transition: width 0.3s; width: 0%; }
+  .big-check { text-align: center; font-size: 48px; padding: 32px 0; }
+</style>
+</head>
+<body>
+<h1>📦 视频档案 — 数据迁移</h1>
+
+<div class="status-row">
+  <span class="status-dot dot-busy" id="dot"></span>
+  <span class="status-text" id="statusText">等待服务器连接...</span>
+</div>
+
+<div class="progress"><div class="progress-bar" id="progress"></div></div>
+<div id="progressText" style="font-size:11px;color:var(--muted);text-align:right">0%</div>
+
+<div id="manualButtons" style="display:none">
+  <button class="btn btn-e" id="btnExport">📤 导出到本地服务器</button>
+  <button class="btn btn-i" id="btnImport">📥 从本地服务器导入</button>
+</div>
+<button class="btn btn-auto" id="btnStop" style="display:none">⏹ 停止</button>
+
+<div class="log" id="log"><span class="info">🔌 正在连接服务器 http://localhost:9877 ...</span></div>
+
+<script>
+const logEl = document.getElementById('log');
+const progressBar = document.getElementById('progress');
+const progressText = document.getElementById('progressText');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const manualButtons = document.getElementById('manualButtons');
+const btnStop = document.getElementById('btnStop');
+
+let SERVER = 'http://localhost:9877';
+let STOP = false;
+
+function log(msg, cls) {
+  const div = document.createElement('div');
+  div.className = cls || '';
+  div.textContent = msg;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setProgress(pct) {
+  progressBar.style.width = `${pct}%`;
+  progressText.textContent = `${pct}%`;
+}
+
+// ─── Detect auto mode from URL hash ─────────────────────
+function getAutoMode() {
+  const h = location.search || location.hash || '';
+  const m = h.match(/auto=(export|import)/);
+  return m ? m[1] : null;
+}
+let AUTO = getAutoMode();
+let alreadyStarted = false; // prevent double-start on hashchange
+
+// ─── IndexedDB helpers ──────────────────────────────────
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('FilmArchive', 3);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve(req.result);
+    req.onupgradeneeded = () => {};
+  });
+}
+
+// ─── Server helpers ─────────────────────────────────────
+async function checkServer() {
+  try {
+    const res = await fetch(`${SERVER}/list`);
+    if (res.ok) {
+      dot.className = 'status-dot dot-ok';
+      statusText.textContent = '服务器已连接';
+      return await res.json();
+    }
+  } catch(e) {}
+  dot.className = 'status-dot dot-err';
+  statusText.textContent = '无法连接服务器 — 请先启动: node migrate-server.js';
+  return null;
+}
+
+async function serverOK() {
+  try {
+    const r = await fetch(`${SERVER}/list`);
+    return r.ok;
+  } catch(e) { return false; }
+}
+
+// ─── EXPORT ─────────────────────────────────────────────
+async function doExport() {
+  logEl.innerHTML = '';
+  setProgress(0);
+  btnStop.style.display = 'block';
+  manualButtons.style.display = 'none';
+
+  try {
+    if (!(await serverOK())) {
+      log('❌ 服务器未连接，请先运行 node migrate-server.js', 'err');
+      return;
+    }
+    log('✅ 服务器已连接', 'ok');
+
+    const db = await openDB();
+    log('✅ IndexedDB 已打开 (FilmArchive v3)', 'ok');
+
+    // Export groups
+    const groups = await new Promise((res, rej) => {
+      const tx = db.transaction('groups', 'readonly');
+      const r = tx.objectStore('groups').getAll();
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    log(`📋 分组: ${groups.length} 个`, 'ok');
+
+    // Phase 1: Collect all video keys and metadata (no blob processing yet)
+    // This avoids IDB transaction timeouts during slow network transfers
+    const videoKeys = [];
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('videos', 'readonly');
+      const store = tx.objectStore('videos');
+      const req = store.openCursor();
+      req.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (!cursor) { resolve(); return; }
+        const v = cursor.value;
+        let ext = 'mp4';
+        if (v.fileType === 'video/webm') ext = 'webm';
+        else if (v.fileType === 'video/quicktime') ext = 'mov';
+        videoKeys.push({
+          id: v.id,
+          title: v.title || '',
+          groupId: v.groupId,
+          description: v.description || '',
+          addedAt: v.addedAt,
+          rotation: v.rotation || 0,
+          width: v.width, height: v.height,
+          duration: v.duration, fps: v.fps,
+          useProxy: v.useProxy || false,
+          fileSize: v.fileSize,
+          fileType: v.fileType,
+          originalName: v.originalName || '',
+          blobExt: ext,
+          hasBlob: !!(v.blob && v.blob instanceof Blob),
+          hasRendered: !!(v.renderedBlob && v.renderedBlob instanceof Blob),
+          blobSize: v.blob && v.blob instanceof Blob ? v.blob.size : 0,
+          renderedSize: v.renderedBlob && v.renderedBlob instanceof Blob ? v.renderedBlob.size : 0,
+        });
+        cursor.continue();
+      };
+      req.onerror = () => reject(req.error);
+    });
+
+    const videoCount = videoKeys.length;
+    log(`🎬 视频总数: ${videoCount}`, 'ok');
+    if (videoCount === 0) { log('⚠️ 没有视频数据可导出', 'warn'); db.close(); return; }
+
+    // Phase 2: Process each video one at a time in a fresh transaction
+    const videoMeta = [];
+    let totalMB = 0;
+
+    for (let i = 0; i < videoKeys.length; i++) {
+      if (STOP) break;
+      const info = videoKeys[i];
+      const idx = i + 1;
+
+      // Open a fresh read transaction for each video
+      try {
+        const record = await new Promise((res, rej) => {
+          const tx = db.transaction('videos', 'readonly');
+          const store = tx.objectStore('videos');
+          const r = store.get(info.id);
+          r.onsuccess = () => res(r.result);
+          r.onerror = () => rej(r.error);
+        });
+
+        if (!record) {
+          log(`  ⚠️ ${idx}/${videoCount}: ${info.title} — 记录不存在，跳过`, 'warn');
+          videoMeta.push({ index: idx, ...info });
+          continue;
+        }
+
+        const blob = record.blob;
+        const rendered = record.renderedBlob;
+
+        // Upload main blob
+        if (blob && blob instanceof Blob && blob.size > 0) {
+          const fname = `video_${idx}_${info.id}.${info.blobExt}`;
+          const mb = (blob.size / 1024 / 1024).toFixed(1);
+          try {
+            const resp = await fetch(`${SERVER}/save?name=${encodeURIComponent(fname)}`, {
+              method: 'POST', body: blob,
+            });
+            if (resp.ok) {
+              totalMB += blob.size / 1024 / 1024;
+              log(`  📹 ${idx}/${videoCount}: ${info.title || '未命名'} (${mb} MB) ✅`, 'ok');
+            } else {
+              log(`  ❌ ${idx}/${videoCount}: ${info.title} — 服务器错误 ${resp.status}`, 'err');
+            }
+          } catch(err) {
+            log(`  ❌ ${idx}/${videoCount}: ${info.title} — 上传失败: ${err.message}`, 'err');
+          }
+        }
+
+        // Upload proxy blob
+        if (rendered && rendered instanceof Blob && rendered.size > 0) {
+          const fname = `video_${idx}_${info.id}_proxy.webm`;
+          try {
+            const resp = await fetch(`${SERVER}/save?name=${encodeURIComponent(fname)}`, {
+              method: 'POST', body: rendered,
+            });
+            if (resp.ok) totalMB += rendered.size / 1024 / 1024;
+          } catch(err) {}
+        }
+
+        videoMeta.push({ index: idx, ...info });
+
+      } catch(err) {
+        log(`  ❌ ${idx}/${videoCount}: ${info.title} — ${err.message}`, 'err');
+        videoMeta.push({ index: idx, ...info });
+      }
+
+      setProgress(Math.round(idx / videoCount * 100));
+    }
+
+    if (STOP) { log('⏹ 已停止', 'warn'); db.close(); return; }
+
+    // Save metadata
+    const metaObj = { groups, exportDate: new Date().toISOString(), videoMeta, totalVideos: videoCount };
+    await fetch(`${SERVER}/save-meta`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(metaObj),
+    });
+
+    setProgress(100);
+    db.close();
+    log('', 'ok');
+    log(`🎉 导出完成！${idx} 个视频，${totalMB.toFixed(0)} MB`, 'ok');
+    log(`📁 文件保存在 migration-data/ 目录`, 'info');
+
+    // Signal completion to server
+    await fetch(`${SERVER}/status?done=export&count=${idx}`);
+
+    dot.className = 'status-dot dot-ok';
+    statusText.textContent = `导出完成 — ${idx} 个视频`;
+    btnStop.style.display = 'none';
+    document.body.insertAdjacentHTML('beforeend', '<div class="big-check">✅</div>');
+
+  } catch(err) {
+    log(`❌ 导出失败: ${err.message}`, 'err');
+    console.error(err);
+  }
+}
+
+// ─── IMPORT ─────────────────────────────────────────────
+async function doImport() {
+  logEl.innerHTML = '';
+  setProgress(0);
+  btnStop.style.display = 'block';
+  manualButtons.style.display = 'none';
+
+  try {
+    if (!(await serverOK())) {
+      log('❌ 服务器未连接', 'err');
+      return;
+    }
+
+    log('📥 获取元数据...', 'info');
+    const metaRes = await fetch(`${SERVER}/file/filmarchive-meta.json`);
+    if (!metaRes.ok) throw new Error('找不到元数据，请先执行导出步骤');
+    const meta = await metaRes.json();
+    log(`✅ ${meta.groups.length} 个分组, ${meta.videoMeta.length} 个视频`, 'ok');
+
+    const db = await openDB();
+    log('✅ IndexedDB 已打开', 'ok');
+
+    // Import groups
+    log('📋 导入分组...', 'info');
+    for (const g of meta.groups) {
+      if (STOP) break;
+      const clean = { ...g };
+      delete clean.compareSlots;
+      delete clean.compareOffsets;
+      delete clean.compareDuration;
+      delete clean.commonStart;
+      delete clean.audioData;
+      await new Promise((res, rej) => {
+        const tx = db.transaction('groups', 'readwrite');
+        tx.objectStore('groups').put(clean);
+        tx.oncomplete = () => res();
+        tx.onerror = () => rej(tx.error);
+      });
+    }
+    log(`✅ ${meta.groups.length} 个分组已导入`, 'ok');
+
+    // Import videos
+    const videos = meta.videoMeta;
+    let imported = 0, skipped = 0, totalMB = 0;
+
+    for (let i = 0; i < videos.length; i++) {
+      if (STOP) break;
+      const v = videos[i];
+      const idx = v.index || (i + 1);
+      const videoObj = {
+        id: v.id, groupId: v.groupId, title: v.title,
+        description: v.description, addedAt: v.addedAt,
+        rotation: v.rotation, width: v.width, height: v.height,
+        duration: v.duration, fps: v.fps,
+        useProxy: v.useProxy || false,
+        fileSize: v.fileSize, fileType: v.fileType, originalName: v.originalName,
+      };
+
+      if (v.hasBlob) {
+        const fname = `video_${idx}_${v.id}.${v.blobExt || 'mp4'}`;
+        try {
+          const res = await fetch(`${SERVER}/file/${encodeURIComponent(fname)}`);
+          if (res.ok) {
+            videoObj.blob = await res.blob();
+            totalMB += videoObj.blob.size / 1024 / 1024;
+            imported++;
+          } else { skipped++; }
+        } catch(err) { skipped++; }
+      }
+
+      if (v.hasRendered) {
+        const fname = `video_${idx}_${v.id}_proxy.webm`;
+        try {
+          const res = await fetch(`${SERVER}/file/${encodeURIComponent(fname)}`);
+          if (res.ok) videoObj.renderedBlob = await res.blob();
+        } catch(err) {}
+      }
+
+      await new Promise((res, rej) => {
+        const tx = db.transaction('videos', 'readwrite');
+        tx.objectStore('videos').put(videoObj);
+        tx.oncomplete = () => res();
+        tx.onerror = () => rej(tx.error);
+      });
+
+      setProgress(Math.round((i + 1) / videos.length * 100));
+      if ((i + 1) % 5 === 0 || i === videos.length - 1) {
+        log(`  📹 ${i+1}/${videos.length}: ${v.title || '未命名'} ✅`, 'ok');
+      }
+    }
+
+    if (STOP) { log('⏹ 已停止', 'warn'); db.close(); return; }
+
+    setProgress(100);
+    db.close();
+
+    log('', 'ok');
+    log(`🎉 导入完成！成功 ${imported} 个视频，${totalMB.toFixed(0)} MB`, 'ok');
+    log(`💡 重启 Electron 应用即可看到所有视频`, 'info');
+
+    await fetch(`${SERVER}/status?done=import&count=${imported}`);
+
+    dot.className = 'status-dot dot-ok';
+    statusText.textContent = `导入完成 — ${imported} 个视频`;
+    btnStop.style.display = 'none';
+    document.body.insertAdjacentHTML('beforeend', '<div class="big-check">✅</div>');
+
+  } catch(err) {
+    log(`❌ 导入失败: ${err.message}`, 'err');
+    console.error(err);
+  }
+}
+
+// ─── Init ───────────────────────────────────────────────
+btnStop.onclick = () => { STOP = true; btnStop.style.display = 'none'; };
+
+async function init() {
+  AUTO = getAutoMode();
+
+  // Check server
+  const files = await checkServer();
+  if (!files) {
+    // Retry after 2 seconds
+    setTimeout(init, 2000);
+    return;
+  }
+
+  // Check auto mode
+  if (AUTO === 'export') {
+    if (alreadyStarted) return;
+    alreadyStarted = true;
+    const hasMeta = files.some(f => f.name === 'filmarchive-meta.json');
+    if (hasMeta) {
+      log('⚠️ 已有导出数据，将覆盖...', 'warn');
+    }
+    log('🤖 自动导出模式，开始导出...', 'info');
+    await doExport();
+    return;
+  }
+
+  if (AUTO === 'import') {
+    if (alreadyStarted) return;
+    alreadyStarted = true;
+    const hasMeta = files.some(f => f.name === 'filmarchive-meta.json');
+    if (!hasMeta) {
+      log('❌ 没有可导入的数据，请先执行导出', 'err');
+      return;
+    }
+    log('🤖 自动导入模式，开始导入...', 'info');
+    await doImport();
+    return;
+  }
+
+  // Manual mode: show buttons
+  manualButtons.style.display = 'block';
+  const hasMeta = files.some(f => f.name === 'filmarchive-meta.json');
+
+  document.getElementById('btnExport').onclick = doExport;
+  document.getElementById('btnImport').onclick = doImport;
+  document.getElementById('btnImport').disabled = !hasMeta;
+
+  if (hasMeta) {
+    try {
+      const metaRes = await fetch(`${SERVER}/file/filmarchive-meta.json`);
+      const meta = await metaRes.json();
+      log(`✅ 服务器已有导出数据: ${meta.totalVideos || meta.videoMeta?.length || '?'} 个视频`, 'ok');
+    } catch(e) {
+      log(`📤 准备好导出 — 请点击「导出到本地服务器」`, 'info');
+    }
+  } else {
+    log(`📤 准备好导出 — 请点击「导出到本地服务器」`, 'info');
+  }
+}
+
+// Listen for hash changes (e.g. user manually adds #auto=export)
+window.addEventListener('hashchange', () => {
+  const newMode = getAutoMode();
+  if (newMode && newMode !== AUTO) {
+    log(`🔄 检测到模式切换: ${newMode}`, 'info');
+    init();
+  }
+});
+
+init();
+</script>
+</body>
+</html>

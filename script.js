@@ -1650,7 +1650,11 @@ async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
   video.playsInline = true;
   video.preload = 'auto';
   video.crossOrigin = 'anonymous';
-  video.volume = 0;          // silent playback
+  // volume MUST be 1 (or >0): with createMediaElementSource, the element's
+  // volume gates the audio that flows into the Web Audio graph.  volume=0
+  // yields all-zero samples.  We silence the speaker output separately via
+  // a zero-gain GainNode downstream.
+  video.volume = 1;
 
   let audioCtx = null;
 
@@ -1661,154 +1665,118 @@ async function extractAudioViaVideoElement(videoUrl, sampleSecs = 12) {
       video.addEventListener('error', () => reject(new Error('video load error')), { once: true });
     });
 
+    // Cap at 60 s — longer window gives the cross-correlation more content
+    // to match on, improving alignment confidence (~11.6 MB per stream).
     const duration = Math.min(video.duration || 30, sampleSecs);
-    const captureSecs = Math.min(duration, 300); // cap at 5 min for memory safety
+    const captureSecs = Math.min(duration, 60);
+    console.log(`[AudioAlign] 视频元素回退：视频时长 ${video.duration.toFixed(1)}s, 将录制 ${captureSecs.toFixed(1)}s`);
 
-    // --- Optimised capture strategy ---
-    // Call play() FIRST to prime the audio decoder pipeline, then capture the
-    // stream synchronously while play is still initialising.  This is the best
-    // compromise between the two extremes:
+    // ── Direct PCM capture via createMediaElementSource ──
+    // Electron 28 MediaRecorder cannot record from captureStream() audio
+    // tracks (empty blobs).  Instead we pipe the <video> element's decoded
+    // audio through the Web Audio graph and capture Float32 samples directly
+    // with a ScriptProcessorNode — no MediaRecorder involved.
     //
-    //   play → capture → record        accurate timing, broken on Vivo/Xiaomi
-    //                                     (capture before play returns 0 tracks)
-    //   capture → record → play        works on Vivo, but on some desktop
-    //                                     browsers the stream never produces data
-    //
-    // By interleaving play() (async) with the synchronous capture setup we
-    // satisfy both: the decoder is already priming when captureStream() runs,
-    // but the recorder is armed almost immediately so the t=0 offset stays
-    // negligible.
+    // IMPORTANT: play() MUST come before createMediaElementSource in
+    // Electron 28 — the reverse order deadlocks the audio scheduler.
     video.currentTime = 0;
-
-    // Start playback (async — kicks off decoder initialisation)
     let playOkay = false;
-    const playPromise = video.play().then(() => { playOkay = true; }).catch(playErr => {
-      console.warn('[AudioAlign] 视频元素回退：play() 被拒绝:', playErr.message);
-    });
-
-    // Synchronously capture while play is priming — on desktop/iOS this
-    // returns active tracks immediately; on Vivo it may still be empty.
-    let stream = video.captureStream();
-    let audioTracks = stream.getAudioTracks();
-
-    // If no tracks yet, wait for play to finish and retry (Vivo path)
-    if (audioTracks.length === 0) {
-      console.log('[AudioAlign] 视频元素回退：播放前无音轨，等待播放完成后再捕获…');
-      await playPromise;
-      if (!playOkay) return null;
-      // Small extra wait for decoder to finish initialising
-      await new Promise(r => setTimeout(r, 150));
-      stream = video.captureStream();
-      audioTracks = stream.getAudioTracks();
-    } else {
-      // Tracks are available — wait a tick for play() to settle so the
-      // stream actually carries data (avoid recording silence)
-      await playPromise;
-      if (!playOkay) return null;
-    }
-
-    if (audioTracks.length === 0) {
-      console.warn('[AudioAlign] 视频元素回退：captureStream 无音轨 — 视频可能没有音频');
-      return null;
-    }
-
-    // Create an audio-only stream
-    const audioStream = new MediaStream(audioTracks);
-
-    // Try audio/webm first (Chromium), fall back to browser default
-    let mimeType = '';
-    for (const candidate of ['audio/webm', 'audio/webm;codecs=opus', 'audio/mp4']) {
-      if (MediaRecorder.isTypeSupported(candidate)) {
-        mimeType = candidate;
-        break;
-      }
-    }
-
-    const chunks = [];
-    const recorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
-
-    let recorderError = null;
-    recorder.onerror = (e) => {
-      recorderError = e.error || new Error('MediaRecorder 错误');
-      console.warn('[AudioAlign] MediaRecorder 错误:', recorderError.message);
-    };
-
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunks.push(e.data);
-    };
-
-    const recorderStopped = new Promise((resolve) => {
-      recorder.onstop = resolve;
-    });
-
-    // Video is already playing — start recorder immediately
     try {
-      recorder.start();
-    } catch (startErr) {
-      console.warn('[AudioAlign] MediaRecorder.start() 失败:', startErr.message);
-      video.pause();
-      audioTracks.forEach(t => t.stop());
-      return null;
+      await video.play();
+      playOkay = true;
+      console.log('[AudioAlign] 视频元素回退：play() 成功');
+    } catch (playErr) {
+      console.warn('[AudioAlign] 视频元素回退：play() 被拒绝:', playErr.message);
     }
 
-    // Record for the target duration
-    await new Promise(r => setTimeout(r, captureSecs * 1000));
+    if (!playOkay) return null;
 
-    // Some Android browsers (e.g. Vivo) auto-transition the recorder to
-    // 'inactive' when the stream's audio codec can't actually be encoded.
-    // Always check state before calling requestData/stop.
-    if (recorder.state === 'recording') {
-      recorder.requestData();
-      recorder.stop();
-    }
-    video.pause();
-
-    // Wait for the final dataavailable / stop event (if recorder was recording)
-    await recorderStopped;
-
-    // Detach audio tracks
-    audioTracks.forEach(t => t.stop());
-
-    if (recorderError && chunks.length === 0) {
-      console.warn('[AudioAlign] 视频元素回退：MediaRecorder 出错且无数据');
-      return null;
-    }
-
-    if (chunks.length === 0) {
-      console.warn('[AudioAlign] 视频元素回退：MediaRecorder 未产生数据');
-      return null;
-    }
-
-    const audioBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
-    const arrayBuffer = await audioBlob.arrayBuffer();
+    // Small delay to let the decoder produce the first frames, then attach
+    // the Web Audio graph.  createMediaElementSource can be called after
+    // play() — it only throws if called twice on the same element.
+    await new Promise(r => setTimeout(r, 500));
 
     audioCtx = new AudioContext();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-    const sampleRate = audioBuffer.sampleRate;
-    const totalSamples = audioBuffer.length;
-    const mono = new Float32Array(totalSamples);
-
-    if (audioBuffer.numberOfChannels === 1) {
-      mono.set(audioBuffer.getChannelData(0));
-    } else {
-      for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
-        const data = audioBuffer.getChannelData(c);
-        for (let i = 0; i < totalSamples; i++) {
-          mono[i] += data[i] / audioBuffer.numberOfChannels;
-        }
-      }
+    if (audioCtx.state === 'suspended') {
+      console.log('[AudioAlign] 视频元素回退：AudioContext suspended，正在 resume…');
+      await audioCtx.resume();
+      console.log('[AudioAlign] 视频元素回退：AudioContext 状态:', audioCtx.state);
     }
 
-    console.log(`[AudioAlign] 视频元素回退成功: ${(mono.length / sampleRate).toFixed(1)}s, ${sampleRate}Hz`);
+    const source = audioCtx.createMediaElementSource(video);
+
+    // Use AnalyserNode to capture time-domain samples.  ScriptProcessorNode
+    // crashes Electron 28's renderer, and MediaRecorder produces empty
+    // blobs from captureStream() — AnalyserNode is the stable path.
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 4096;              // 4096 samples ≈ 85 ms @ 44.1 kHz
+    analyser.smoothingTimeConstant = 0;   // no smoothing — raw samples
+    source.connect(analyser);
+
+    // Route analyser → zero-gain → destination.  The zero-gain node keeps
+    // the graph "live" (so samples flow) while muting the speakers.
+    const muteGain = audioCtx.createGain();
+    muteGain.gain.value = 0;
+    analyser.connect(muteGain);
+    muteGain.connect(audioCtx.destination);
+
+    // Collect one fftSize window per sampling interval.  Interval chosen
+    // slightly below the window duration so windows tile with small overlap
+    // (guarantees no gaps regardless of the actual AudioContext sample rate).
+    const sampleRate = audioCtx.sampleRate;
+    const windowSecs = analyser.fftSize / sampleRate;
+    const sampleIntervalMs = Math.max(30, Math.round(windowSecs * 1000 * 0.8));
+
+    const timeData = new Float32Array(analyser.fftSize);
+    const chunks = [];
+    const startTime = performance.now();
+
+    console.log(`[AudioAlign] 视频元素回退：音频图已连接（AnalyserNode），开始录制 ${captureSecs.toFixed(1)}s…`);
+
+    while (performance.now() - startTime < captureSecs * 1000) {
+      analyser.getFloatTimeDomainData(timeData);
+      chunks.push(new Float32Array(timeData)); // copy the window
+      await new Promise(r => setTimeout(r, sampleIntervalMs));
+    }
+
+    video.pause();
+
+    // Tear down the audio graph
+    try { source.disconnect(); } catch (e) { /* ok */ }
+    try { analyser.disconnect(); } catch (e) { /* ok */ }
+    try { muteGain.disconnect(); } catch (e) { /* ok */ }
+
+    // Concatenate all captured windows into a single Float32Array
+    const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
+    if (totalLen === 0) {
+      console.warn('[AudioAlign] 视频元素回退：AnalyserNode 未采集到数据 — 视频可能没有音轨');
+      audioCtx.close();
+      audioCtx = null;
+      return null;
+    }
+
+    const mono = new Float32Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+      mono.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const actualSecs = mono.length / sampleRate;
+    audioCtx.close();
+    audioCtx = null;
+
+    console.log(`[AudioAlign] 视频元素回退成功: ${actualSecs.toFixed(1)}s PCM, ${sampleRate}Hz (AnalyserNode, ${chunks.length} 个窗口)`);
     return { samples: mono, sampleRate, _fallback: true };
 
   } catch (err) {
     console.warn('[AudioAlign] 视频元素回退失败:', err.message);
     return null;
   } finally {
-    if (audioCtx) audioCtx.close();
-    video.pause();
+    if (audioCtx) {
+      try { audioCtx.close(); } catch (e) { /* already closed */ }
+    }
+    try { video.pause(); } catch (e) { /* already removed */ }
     video.src = '';
     video.remove();
   }
@@ -1969,12 +1937,16 @@ async function performAudioAlignment() {
   showToast('正在提取音频、检测内容边界并对齐…');
 
   try {
-    // --- Phase 1: extract audio from all filled slots (CONCURRENT) ---
-    // CRITICAL: All extractions start simultaneously so that the fallback
-    // method's video.play() calls all happen within Chrome's ~5 s user-gesture
-    // window.  A sequential loop would push later slots past the deadline.
-    // See [[android-audio-user-gesture-bug]] for the full history.
-    const extractionResults = await Promise.all(filled.map(async (slot) => {
+    // --- Phase 1: extract audio from all filled slots ---
+    // Electron: process sequentially — Electron 28's audio subsystem has
+    // a concurrency limit on createMediaElementSource / ScriptProcessorNode
+    // that causes deadlocks with >1 parallel extraction.
+    // Browser: fan out concurrently to stay inside the ~5 s user-gesture
+    // window for video.play().  See [[android-audio-user-gesture-bug]].
+    const isElectron = !!(window.electronAPI || (typeof process !== 'undefined' && process.type));
+    console.log(`[AudioAlign] 运行环境: isElectron=${isElectron}, hasElectronAPI=${!!window.electronAPI}, hasProcess=${typeof process !== 'undefined'}`);
+    const extractionResults = [];
+    const processSlot = async (slot) => {
       const result = findVideo(slot.videoId);
       if (!result) return null;
 
@@ -2007,7 +1979,15 @@ async function performAudioAlignment() {
         console.warn(`[AudioAlign] 槽位 ${slot.slotIdx} 音频提取失败（所有方法均失败，视频可能无音轨）`);
       }
       return extracted;
-    }));
+    };
+
+    if (isElectron) {
+      for (const slot of filled) {
+        extractionResults.push(await processSlot(slot));
+      }
+    } else {
+      extractionResults.push(...(await Promise.all(filled.map(processSlot))));
+    }
 
     const audioData = extractionResults;
 

@@ -1,2 +1,6 @@
 .claude/
 .DS_Store
+node_modules/
+dist/
+视频档案.app/
+migration-data/
